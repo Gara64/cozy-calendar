@@ -74,6 +74,9 @@
     "Event": {
       "description": "Creates and edits your events."
     },
+    "Sharing": {
+      "description": "Creates and edits what you share to others and what is shared to you"
+    },
     "User": {
       "description": "Used to recover your timezone"
     },
