@@ -114,8 +114,9 @@
 })();
 require.register("application.coffee", function(exports, require, module) {
 module.exports = {
+  listenTo: Backbone.Model.prototype.listenTo,
   initialize: function() {
-    var CalendarsCollection, ContactCollection, EventCollection, Header, Menu, Router, SocketListener, TagCollection, e, error, i, j, locales, m1, m2, now, todayChecker;
+    var CalendarsCollection, ContactCollection, EventCollection, Header, Menu, Router, SharingCollection, SocketListener, TagCollection, e, error, i, isMobile, j, locales, m1, m2, now, todayChecker;
     window.app = this;
     this.timezone = window.timezone;
     delete window.timezone;
@@ -139,10 +140,12 @@ module.exports = {
     EventCollection = require('collections/events');
     ContactCollection = require('collections/contacts');
     CalendarsCollection = require('collections/calendars');
+    SharingCollection = require('collections/sharings');
     this.tags = new TagCollection();
     this.events = new EventCollection();
     this.contacts = new ContactCollection();
     this.calendars = new CalendarsCollection();
+    this.pendingEventSharings = new SharingCollection();
     this.mainStore = {
       loadedMonths: {}
     };
@@ -154,13 +157,21 @@ module.exports = {
       this.mainStore.loadedMonths[m2] = true;
     }
     this.mainStore.loadedMonths[now.format('YYYY-MM')] = true;
-    this.router = new Router();
+    isMobile = this.isMobile();
+    this.router = new Router({
+      isMobile: isMobile
+    });
     this.menu = new Menu({
       collection: this.calendars
     });
     this.menu.render().$el.prependTo('body');
     SocketListener.watch(this.events);
     SocketListener.watch(this.contacts);
+    SocketListener.watch(this.pendingEventSharings);
+    if (window.initcalendars != null) {
+      this.calendars.reset(window.initcalendars);
+      delete window.initcalendars;
+    }
     if (window.inittags != null) {
       this.tags.reset(window.inittags);
       delete window.inittags;
@@ -173,11 +184,18 @@ module.exports = {
       this.contacts.reset(window.initcontacts);
       delete window.initcontacts;
     }
+    if (window.initPendingEventSharings) {
+      this.pendingEventSharings.reset(window.initPendingEventSharings);
+      delete window.initPendingEventSharings;
+    }
     Backbone.history.start();
     todayChecker = require('lib/today_checker');
     todayChecker(this.router);
     if (typeof Object.freeze === 'function') {
-      return Object.freeze(this);
+      Object.freeze(this);
+    }
+    if (isMobile) {
+      return document.body.classList.add('is-mobile');
     }
   },
   isMobile: function() {
@@ -216,14 +234,12 @@ module.exports = CalendarCollection = (function(superClass) {
   CalendarCollection.prototype.initialize = function() {
     this.eventCollection = app.events;
     this.listenTo(this.eventCollection, 'add', this.onBaseCollectionAdd);
-    this.listenTo(this.eventCollection, 'change:tags', this.onBaseCollectionChange);
     this.listenTo(this.eventCollection, 'remove', this.onBaseCollectionRemove);
     this.listenTo(this.eventCollection, 'reset', this.resetFromBase);
     return this.resetFromBase();
   };
 
   CalendarCollection.prototype.resetFromBase = function() {
-    this.reset([]);
     return this.eventCollection.each((function(_this) {
       return function(model) {
         return _this.onBaseCollectionAdd(model);
@@ -231,16 +247,12 @@ module.exports = CalendarCollection = (function(superClass) {
     })(this));
   };
 
-  CalendarCollection.prototype.onBaseCollectionChange = function(model) {
-    return this.resetFromBase();
-  };
-
   CalendarCollection.prototype.onBaseCollectionAdd = function(model) {
     var calendar, calendarName, ref, tags;
     ref = model.get('tags'), calendarName = ref[0], tags = 2 <= ref.length ? slice.call(ref, 1) : [];
     calendar = app.tags.getOrCreateByName(calendarName);
-    this.add(calendar);
     if (calendar.isNew()) {
+      this.add(calendar);
       app.tags.add(calendar);
       return calendar.save();
     }
@@ -272,6 +284,9 @@ module.exports = CalendarCollection = (function(superClass) {
         if (err) {
           return callback(t('server error occured'));
         } else {
+          CalendarCollection.__super__.remove.call(_this, _this.findWhere({
+            name: calendarName
+          }));
           return callback();
         }
       };
@@ -284,9 +299,10 @@ module.exports = CalendarCollection = (function(superClass) {
       newName: newName
     }, function(err) {
       if (err) {
-        return callback(t('server error occured'));
+        console.error(t('server error occured'), err);
+        return callback(oldName);
       } else {
-        return callback();
+        return callback(newName);
       }
     });
   };
@@ -760,34 +776,43 @@ module.exports = ScheduleItemsCollection = (function(superClass) {
     return si1.getDateObject().diff(si2.getDateObject());
   };
 
+  ScheduleItemsCollection.prototype.visibleItems = function(calendars) {
+    return new ScheduleItemsCollection(this.filter(function(scheduleItem) {
+      var calendar, ref;
+      if (scheduleItem.isShared()) {
+        return true;
+      }
+      calendar = calendars.get((ref = scheduleItem.getCalendar()) != null ? ref.get('id') : void 0);
+      return calendar != null ? calendar.get('visible') : void 0;
+    }));
+  };
+
   ScheduleItemsCollection.prototype.getFCEventSource = function(calendars) {
     return (function(_this) {
       return function(start, end, timezone, callback) {
-        var eventsInRange;
+        var eventsInRange, ref;
         eventsInRange = [];
-        _this.each(function(item) {
-          var calendar, duration, e, error, itemEnd, itemStart;
-          itemStart = item.getStartDateObject();
-          itemEnd = item.getEndDateObject();
-          duration = itemEnd - itemStart;
-          calendar = item.getCalendar();
-          if (calendar && calendar.get('visible') === false) {
-            return null;
-          }
-          if (item.isRecurrent()) {
-            try {
-              return eventsInRange = eventsInRange.concat(item.getRecurrentFCEventBetween(start, end));
-            } catch (error) {
-              e = error;
-              console.error(e);
-              if (item.isInRange(start, end)) {
-                return eventsInRange.push(item.toPunctualFullCalendarEvent());
+        if ((ref = _this.visibleItems(calendars)) != null) {
+          ref.each(function(item) {
+            var duration, e, error, itemEnd, itemStart;
+            itemStart = item.getStartDateObject();
+            itemEnd = item.getEndDateObject();
+            duration = itemEnd - itemStart;
+            if (item.isRecurrent()) {
+              try {
+                return eventsInRange = eventsInRange.concat(item.getRecurrentFCEventBetween(start, end));
+              } catch (error) {
+                e = error;
+                console.error(e);
+                if (item.isInRange(start, end)) {
+                  return eventsInRange.push(item.toPunctualFullCalendarEvent());
+                }
               }
+            } else if (item.isInRange(start, end)) {
+              return eventsInRange.push(item.toPunctualFullCalendarEvent());
             }
-          } else if (item.isInRange(start, end)) {
-            return eventsInRange.push(item.toPunctualFullCalendarEvent());
-          }
-        });
+          });
+        }
         return callback(eventsInRange);
       };
     })(this);
@@ -800,6 +825,35 @@ module.exports = ScheduleItemsCollection = (function(superClass) {
   };
 
   return ScheduleItemsCollection;
+
+})(Backbone.Collection);
+});
+
+;require.register("collections/sharings.coffee", function(exports, require, module) {
+var Sharing, SharingCollection,
+  extend = function(child, parent) { for (var key in parent) { if (hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; },
+  hasProp = {}.hasOwnProperty;
+
+Sharing = require('../models/sharing');
+
+module.exports = SharingCollection = (function(superClass) {
+  extend(SharingCollection, superClass);
+
+  function SharingCollection() {
+    return SharingCollection.__super__.constructor.apply(this, arguments);
+  }
+
+  SharingCollection.prototype.model = Sharing;
+
+  SharingCollection.prototype.initialize = function() {
+    return this.on('accepted refused', this.onAnsweredSharing);
+  };
+
+  SharingCollection.prototype.onAnsweredSharing = function(sharing) {
+    return this.remove(sharing);
+  };
+
+  return SharingCollection;
 
 })(Backbone.Collection);
 });
@@ -1153,6 +1207,19 @@ module.exports = BaseView = (function(superClass) {
     return Backbone.View.prototype.remove.call(this);
   };
 
+  BaseView.prototype.snap = function(view) {
+    var selector;
+    selector = this.id ? "#" + this.id : "." + this.className;
+    view.$(selector).each((function(_this) {
+      return function(index, element) {
+        if (element) {
+          return _this.setElement(element);
+        }
+      };
+    })(this));
+    return this;
+  };
+
   return BaseView;
 
 })(Backbone.View);
@@ -1338,7 +1405,8 @@ module.exports = PopoverScreenView = (function(superClass) {
     return console.log('Warning, no template has been defined for content.');
   };
 
-  function PopoverScreenView(options) {
+  function PopoverScreenView(options, context) {
+    this.context = context;
     PopoverScreenView.__super__.constructor.call(this, options);
     if (options.titleElement == null) {
       throw new Error('options.titleElement must be defined.');
@@ -1477,7 +1545,7 @@ module.exports = PopoverView = (function(superClass) {
       titleElement: this.titleElement,
       contentElement: this.contentElement,
       popover: this
-    });
+    }, this.context);
     this.screen.render();
     return this.screenElement.attr('data-screen', screenID);
   };
@@ -1558,6 +1626,35 @@ module.exports = PopoverView = (function(superClass) {
   };
 
   return PopoverView;
+
+})(BaseView);
+});
+
+;require.register("lib/popup_view.coffee", function(exports, require, module) {
+var BaseView, PopupView,
+  extend = function(child, parent) { for (var key in parent) { if (hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; },
+  hasProp = {}.hasOwnProperty;
+
+BaseView = require('lib/base_view');
+
+module.exports = PopupView = (function(superClass) {
+  extend(PopupView, superClass);
+
+  function PopupView() {
+    return PopupView.__super__.constructor.apply(this, arguments);
+  }
+
+  PopupView.prototype.initialize = function(options) {
+    PopupView.__super__.initialize.apply(this, arguments);
+    return this.anchor = options.anchor;
+  };
+
+  PopupView.prototype.toggle = function(display) {
+    this.$el.toggle(display);
+    return this;
+  };
+
+  return PopupView;
 
 })(BaseView);
 });
@@ -1643,10 +1740,11 @@ SocketListener = (function(superClass) {
 
   SocketListener.prototype.models = {
     'event': require('models/event'),
-    'contact': require('models/contact')
+    'contact': require('models/contact'),
+    'sharing': require('models/sharing')
   };
 
-  SocketListener.prototype.events = ['event.create', 'event.update', 'event.delete', 'contact.create', 'contact.update', 'contact.delete'];
+  SocketListener.prototype.events = ['event.create', 'event.update', 'event.delete', 'contact.create', 'contact.update', 'contact.delete', 'sharing.create', 'sharing.delete'];
 
   function SocketListener() {
     this.handleModel = bind(this.handleModel, this);
@@ -1654,18 +1752,38 @@ SocketListener = (function(superClass) {
     this.queue = async.queue(this.handleModel, 1);
   }
 
+  SocketListener.prototype.onEvent = function(event) {
+    var start;
+    start = moment(event.get('start')).format('YYYY-MM');
+    if (window.app.mainStore.loadedMonths[start]) {
+      return this.onRemoteCreateOrUpdate(event);
+    }
+  };
+
+  SocketListener.prototype.onSharing = function(sharing) {
+    var currentUserIsTheRecipient, rules, targets;
+    targets = sharing.get('targets');
+    currentUserIsTheRecipient = !targets;
+    console.debug(currentUserIsTheRecipient, targets);
+    rules = sharing.get('rules');
+    if (currentUserIsTheRecipient && rules && rules.find(function(rule) {
+      return rule.docType.toLowerCase() === 'event';
+    })) {
+      return this.onRemoteCreateOrUpdate(sharing);
+    }
+  };
+
   SocketListener.prototype.handleModel = function(model, next) {
     return model.fetch({
       success: (function(_this) {
         return function(fetched) {
-          var start;
-          if (fetched.get('docType') !== 'event') {
-            _this.onRemoteCreateOrUpdate(fetched);
+          var docType, handler;
+          docType = fetched.get('docType');
+          handler = 'on' + docType.charAt(0).toUpperCase() + docType.slice(1);
+          if (typeof _this[handler] === 'function') {
+            _this[handler](fetched);
           } else {
-            start = moment(fetched.get('start')).format('YYYY-MM');
-            if (window.app.mainStore.loadedMonths[start]) {
-              _this.onRemoteCreateOrUpdate(fetched);
-            }
+            _this.onRemoteCreateOrUpdate(fetched);
           }
           return setTimeout(next, 50);
         };
@@ -1708,7 +1826,6 @@ SocketListener = (function(superClass) {
     for (i = 0, len = ref.length; i < len; i++) {
       collection = ref[i];
       if (fetched instanceof collection.model) {
-        console.log('D');
         results.push(collection.add(fetched, {
           merge: true
         }));
@@ -1826,6 +1943,9 @@ module.exports = ViewCollection = (function(superClass) {
   };
 
   ViewCollection.prototype.initialize = function() {
+    if (!this.collection) {
+      throw new Error('Collection is undefined');
+    }
     ViewCollection.__super__.initialize.apply(this, arguments);
     this.views = {};
     this.listenTo(this.collection, "reset", this.onReset);
@@ -1836,6 +1956,13 @@ module.exports = ViewCollection = (function(superClass) {
       this.collectionEl = this.el;
       return this.$collectionEl = this.$el;
     }
+  };
+
+  ViewCollection.prototype.getRenderData = function() {
+    var ref;
+    return {
+      collection: (ref = this.collection) != null ? ref.toJSON() : void 0
+    };
   };
 
   ViewCollection.prototype.render = function() {
@@ -2039,6 +2166,11 @@ module.exports = {
     "duplicate event tooltip": "Duplicate event",
     "delete event tooltip": "Delete event",
     "change calendar": "Change calendar",
+    "screen confirm title": "Are you sure?",
+    "screen confirm description": "The change you made in this popover will be lost.",
+    "screen confirm yes button": "Don't save",
+    "screen confirm no button": "Cancel",
+    "dont ask again": "Dont ask for confirmation when exiting the popover.",
     "screen delete title": "Delete event",
     "screen delete description": "You are about to delete the event \"%{description}\". Are you sure?",
     "screen delete yes button": "Yes",
@@ -2085,6 +2217,10 @@ module.exports = {
     "screen recurrence summary label": "Summary",
     "send mails question": "Send a notification email to:",
     "modal send mails": "Send a notification",
+    "accepted": "Accepted",
+    "declined": "Declined",
+    "need action": "No answer yet",
+    "mail not sent": "No invitation sent",
     "yes": "Yes",
     "no": "No",
     "no summary": "A summary must be set.",
@@ -2564,6 +2700,8 @@ module.exports = {
   "screen guest input placeholder": "Email address",
   "screen guest add button": "Add",
   "screen guest remove tooltip": "Cancel the invitation",
+  "screen guest share with cozy tooltip": "Share the invitation with the guest's cozy",
+  "screen guest share with email tooltip": "Send the invitation as an e-mail",
   "screen description title": "Description",
   "screen alert title empty": "Alert",
   "screen alert title": "%{smart_count} alert |||| %{smart_count} alerts",
@@ -2600,6 +2738,7 @@ module.exports = {
   "screen recurrence ends until placeholder": "Until [date]",
   "screen recurrence summary label": "Summary",
   "send mails question": "Send a notification email to:",
+  "send invitations question": "Send an invitation to:",
   "modal send mails": "Send a notification",
   "accepted": "Accepted",
   "declined": "Declined",
@@ -2816,6 +2955,11 @@ module.exports = {
     "duplicate event tooltip": "Duplicate event",
     "delete event tooltip": "Delete event",
     "change calendar": "Change calendar",
+    "screen confirm title": "Are you sure?",
+    "screen confirm description": "The change you made in this popover will be lost.",
+    "screen confirm yes button": "Don't save",
+    "screen confirm no button": "Cancel",
+    "dont ask again": "Dont ask for confirmation when exiting the popover.",
     "screen delete title": "Delete event",
     "screen delete description": "You are about to delete the event \"%{description}\". Are you sure?",
     "screen delete yes button": "Yes",
@@ -2862,6 +3006,10 @@ module.exports = {
     "screen recurrence summary label": "Summary",
     "send mails question": "Send a notification email to:",
     "modal send mails": "Send a notification",
+    "accepted": "Accepted",
+    "declined": "Declined",
+    "need action": "No answer yet",
+    "mail not sent": "No invitation sent",
     "yes": "Yes",
     "no": "No",
     "no summary": "A summary must be set.",
@@ -3324,6 +3472,11 @@ module.exports = {
     "duplicate event tooltip": "Dupliquer l’événement",
     "delete event tooltip": "Supprimer l’événement",
     "change calendar": "Modifier l'agenda",
+    "screen confirm title": "Vous confirmez ?",
+    "screen confirm description": "Les modifications de l'évènement seront perdues.",
+    "screen confirm yes button": "Abandonner les modifications",
+    "screen confirm no button": "Annuler",
+    "dont ask again": "Ne plus me demander de confirmer.",
     "screen delete title": "Supprimer l’événement",
     "screen delete description": "Vous êtes sur le point de supprimer l’événement \"%{description}\". Êtes-vous sûr(e) ?",
     "screen delete yes button": "Oui",
@@ -3370,6 +3523,10 @@ module.exports = {
     "screen recurrence summary label": "Résumé",
     "send mails question": "Envoyer un email de notification à :",
     "modal send mails": "Envoyer une notification",
+    "accepted": "Accepté",
+    "declined": "Refusé",
+    "need action": "Pas de réponse",
+    "mail not sent": "L'invitation n'a pas été envoyée",
     "yes": "Oui",
     "no": "Non",
     "no summary": "Le titre est obligatoire.",
@@ -3426,8 +3583,8 @@ module.exports = {
     "Nov": "Nov",
     "Dec": "Déc",
     "calendar exist error": "Un  agenda nommé \"Nouvel agenda\" existe déjà.",
-    "email date format": "D MMMM YYYY - HH:MM",
-    "email date format allday": "D MMMM YYYY, [toute la journée]",
+    "email date format": "MMMM Do YYYY, h:mm a",
+    "email date format allday": "MMMM Do YYYY, [toute la journée]",
     "email invitation title": "Invitation à '%{description}'",
     "email invitation content": "Bonjour, je souhaiterais vous inviter à l’événement suivant :\n%{description} %{place}\nLe %{date}\nSerez-vous présent ?\n\nOui\n%{url}?status=ACCEPTED&key=%{key}\n\nNon\n%{url}?status=DECLINED&key=%{key}",
     "email update title": "L’événement \"%{description}\" a changé",
@@ -3435,8 +3592,7 @@ module.exports = {
     "email delete title": "Cet événement a été annulé : %{description}",
     "email delete content": "Cet événement a été annulé :\n%{description} %{place}\nLe %{date}",
     "invalid recurring rule": "La règle de récursion est invalide"
-}
-;
+};
 });
 
 require.register("locales/id.json", function(exports, require, module) {
@@ -3579,6 +3735,11 @@ module.exports = {
     "duplicate event tooltip": "Duplicate event",
     "delete event tooltip": "Delete event",
     "change calendar": "Change calendar",
+    "screen confirm title": "Are you sure?",
+    "screen confirm description": "The change you made in this popover will be lost.",
+    "screen confirm yes button": "Don't save",
+    "screen confirm no button": "Cancel",
+    "dont ask again": "Dont ask for confirmation when exiting the popover.",
     "screen delete title": "Delete event",
     "screen delete description": "You are about to delete the event \"%{description}\". Are you sure?",
     "screen delete yes button": "Yes",
@@ -3625,6 +3786,10 @@ module.exports = {
     "screen recurrence summary label": "Summary",
     "send mails question": "Send a notification email to:",
     "modal send mails": "Send a notification",
+    "accepted": "Accepted",
+    "declined": "Declined",
+    "need action": "No answer yet",
+    "mail not sent": "No invitation sent",
     "yes": "Yes",
     "no": "No",
     "no summary": "A summary must be set.",
@@ -3833,6 +3998,11 @@ module.exports = {
     "duplicate event tooltip": "Duplica Evento",
     "delete event tooltip": "Delete event",
     "change calendar": "Change calendar",
+    "screen confirm title": "Are you sure?",
+    "screen confirm description": "The change you made in this popover will be lost.",
+    "screen confirm yes button": "Don't save",
+    "screen confirm no button": "Cancel",
+    "dont ask again": "Dont ask for confirmation when exiting the popover.",
     "screen delete title": "Delete event",
     "screen delete description": "You are about to delete the event \"%{description}\". Are you sure?",
     "screen delete yes button": "Yes",
@@ -3879,6 +4049,10 @@ module.exports = {
     "screen recurrence summary label": "Summary",
     "send mails question": "Send a notification email to:",
     "modal send mails": "Send a notification",
+    "accepted": "Accepted",
+    "declined": "Declined",
+    "need action": "No answer yet",
+    "mail not sent": "No invitation sent",
     "yes": "Yes",
     "no": "No",
     "no summary": "A summary must be set.",
@@ -4087,6 +4261,11 @@ module.exports = {
     "duplicate event tooltip": "イベントの複製",
     "delete event tooltip": "イベントを削除",
     "change calendar": "カレンダーを変更",
+    "screen confirm title": "よろしいですか?",
+    "screen confirm description": "このポップオーバーで行われた変更は失われます。",
+    "screen confirm yes button": "保存しない",
+    "screen confirm no button": "キャンセル",
+    "dont ask again": "ポップオーバーを終了するときに確認しません。",
     "screen delete title": "イベントを削除",
     "screen delete description": "イベント \"%{description}\" を削除します。よろしいですか?",
     "screen delete yes button": "はい",
@@ -4133,6 +4312,10 @@ module.exports = {
     "screen recurrence summary label": "サマリー",
     "send mails question": "通知メール送信先:",
     "modal send mails": "通知を送信",
+    "accepted": "承諾",
+    "declined": "否認",
+    "need action": "まだ回答はありません",
+    "mail not sent": "送信した招待状はありません",
     "yes": "はい",
     "no": "いいえ",
     "no summary": "サマリーは設定する必要があります。",
@@ -4341,6 +4524,11 @@ module.exports = {
     "duplicate event tooltip": "이벤트 중복",
     "delete event tooltip": "이벤트 삭제",
     "change calendar": "캘린더 변경",
+    "screen confirm title": "Are you sure?",
+    "screen confirm description": "The change you made in this popover will be lost.",
+    "screen confirm yes button": "Don't save",
+    "screen confirm no button": "Cancel",
+    "dont ask again": "Dont ask for confirmation when exiting the popover.",
     "screen delete title": "이벤트 삭제",
     "screen delete description": "정말로 %{calendarName} 캘린더의 모든 이벤트를 삭제 하시겠습니까?",
     "screen delete yes button": "예",
@@ -4387,6 +4575,10 @@ module.exports = {
     "screen recurrence summary label": "요약",
     "send mails question": "공지 보내기:",
     "modal send mails": "공지 보내기",
+    "accepted": "Accepted",
+    "declined": "Declined",
+    "need action": "No answer yet",
+    "mail not sent": "No invitation sent",
     "yes": "예",
     "no": "아니오",
     "no summary": "요약은 필수 입력 항목 입니다.",
@@ -4595,6 +4787,11 @@ module.exports = {
     "duplicate event tooltip": "Duplicate event",
     "delete event tooltip": "Delete event",
     "change calendar": "Change calendar",
+    "screen confirm title": "Are you sure?",
+    "screen confirm description": "The change you made in this popover will be lost.",
+    "screen confirm yes button": "Don't save",
+    "screen confirm no button": "Cancel",
+    "dont ask again": "Dont ask for confirmation when exiting the popover.",
     "screen delete title": "Delete event",
     "screen delete description": "You are about to delete the event \"%{description}\". Are you sure?",
     "screen delete yes button": "Yes",
@@ -4641,6 +4838,10 @@ module.exports = {
     "screen recurrence summary label": "Summary",
     "send mails question": "Send a notification email to:",
     "modal send mails": "Send a notification",
+    "accepted": "Accepted",
+    "declined": "Declined",
+    "need action": "No answer yet",
+    "mail not sent": "No invitation sent",
     "yes": "Yes",
     "no": "No",
     "no summary": "A summary must be set.",
@@ -4849,6 +5050,11 @@ module.exports = {
     "duplicate event tooltip": "Duplicate event",
     "delete event tooltip": "Delete event",
     "change calendar": "Change calendar",
+    "screen confirm title": "Are you sure?",
+    "screen confirm description": "The change you made in this popover will be lost.",
+    "screen confirm yes button": "Don't save",
+    "screen confirm no button": "Cancel",
+    "dont ask again": "Dont ask for confirmation when exiting the popover.",
     "screen delete title": "Delete event",
     "screen delete description": "You are about to delete the event \"%{description}\". Are you sure?",
     "screen delete yes button": "Yes",
@@ -4895,6 +5101,10 @@ module.exports = {
     "screen recurrence summary label": "Summary",
     "send mails question": "Send a notification email to:",
     "modal send mails": "Send a notification",
+    "accepted": "Accepted",
+    "declined": "Declined",
+    "need action": "No answer yet",
+    "mail not sent": "No invitation sent",
     "yes": "Yes",
     "no": "No",
     "no summary": "A summary must be set.",
@@ -5273,12 +5483,12 @@ module.exports = {
     "Create": "Создать",
     "Events to import": "События для импорта",
     "Create Event": "Создать событие",
-    "From [hours:minutes]": "From [hours:minutes]",
-    "To [hours:minutes]": "To [hours:minutes]",
-    "To [date]": "To [date]",
+    "From [hours:minutes]": "От [hours:minutes]",
+    "To [hours:minutes]": "До [hours:minutes]",
+    "To [date]": "До [date]",
     "Description": "Описание",
-    "days after": "days after",
-    "days later": "days later",
+    "days after": "дней до",
+    "days later": "дней позже",
     "Week": "Неделя",
     "Display": "Уведомление",
     "DISPLAY": "Уведомление",
@@ -5296,7 +5506,7 @@ module.exports = {
     "no description": "Нет описания",
     "add calendar": "Добавить календарь",
     "new calendar": "Новый календарь",
-    "multiple actions": "Multiple actions",
+    "multiple actions": "Несколько действий",
     "recurrence": "Повтор",
     "recurrence rule": "Правила повтора",
     "make reccurent": "Сделать повторяющимся",
@@ -5309,7 +5519,7 @@ module.exports = {
     "after": "После",
     "repeat": "Повторять",
     "forever": "Всегда",
-    "occurences": "occurences",
+    "occurences": "вхождений",
     "every": "Каждые",
     "minutes": "минут",
     "minute ": "минута",
@@ -5326,116 +5536,125 @@ module.exports = {
     "until": "до",
     "for": "для",
     "on": "на",
-    "on the": "on the",
+    "on the": "на ",
     "th": "th",
     "nd": "nd",
     "rd": "rd",
     "st": "st",
-    "last": "last",
-    "and": "and",
-    "times": "times",
-    "weekday": "weekday",
-    "screen title done button": "Done",
-    "placeholder event title": "Event title",
-    "from": "From",
-    "placeholder from date": "From [date]",
-    "placeholder from time": "From [hours:minutes]",
-    "to": "To",
-    "placeholder to date": "To [date]",
-    "placeholder to time": "To [hours:minutes]",
+    "last": "последний",
+    "and": "и",
+    "times": "раз",
+    "weekday": "будний день",
+    "screen title done button": "Выполнено",
+    "placeholder event title": "Название события",
+    "from": "От",
+    "placeholder from date": "От [date]",
+    "placeholder from time": "От [hours:minutes]",
+    "to": "до",
+    "placeholder to date": "До [date]",
+    "placeholder to time": "До [hours:minutes]",
     "placeholder place": "Место",
-    "add guest button": "Add guest",
-    "guests list": "%{first} and %{smart_count} other |||| %{first} and %{smart_count} others",
+    "add guest button": "Добавить гостя",
+    "guests list": "%{first} и %{smart_count} другой |||| %{first} и %{smart_count} других",
     "placeholder description": "Описание",
-    "no alert button": "No alert",
-    "alert label": "%{smart_count} alert scheduled |||| %{smart_count} alerts scheduled",
-    "alert tooltip": "Manage alerts",
-    "no repeat button": "No repeat",
-    "repeat tooltip": "Manage recurrence",
+    "no alert button": "Без оповещения",
+    "alert label": "%{smart_count} запланированное оповещение |||| %{smart_count} запланированных оповещений",
+    "alert tooltip": "Настроить оповещение",
+    "no repeat button": "Без повторений",
+    "repeat tooltip": "Настройка повторений",
     "more details button": "Еще опции",
     "save button": "Сохранить",
     "create button": "Создать",
     "duplicate event tooltip": "Продублировать событие",
-    "delete event tooltip": "Delete event",
-    "change calendar": "Change calendar",
-    "screen delete title": "Delete event",
-    "screen delete description": "You are about to delete the event \"%{description}\". Are you sure?",
-    "screen delete yes button": "Yes",
-    "screen delete no button": "No",
-    "screen guest title empty": "Guest",
-    "screen guest title": "%{smart_count} guest |||| %{smart_count} guests",
-    "screen guest input placeholder": "Email address",
+    "delete event tooltip": "Удалить событие",
+    "change calendar": "Изменить календарь",
+    "screen confirm title": "Уверены?",
+    "screen confirm description": "Изменения, внесенные в этот поповер будут потеряны.",
+    "screen confirm yes button": "Не сохранять",
+    "screen confirm no button": "Отмена",
+    "dont ask again": "Не запрашивать подтверждение при выходе из поповер.",
+    "screen delete title": "Удалить событие",
+    "screen delete description": "Вы собираетесь удалить событие \"%{description}\". Вы уверены?",
+    "screen delete yes button": "Да",
+    "screen delete no button": "Нет",
+    "screen guest title empty": "Гость",
+    "screen guest title": "%{smart_count} гость |||| %{smart_count} гостей",
+    "screen guest input placeholder": "Email адрес",
     "screen guest add button": "Добавить",
-    "screen guest remove tooltip": "Cancel the invitation",
+    "screen guest remove tooltip": "Отменить приглашение",
     "screen description title": "Описание",
-    "screen alert title empty": "Alert",
-    "screen alert title": "%{smart_count} alert |||| %{smart_count} alerts",
-    "screen alert default value": "Add new alert",
-    "screen alert time of event": "Time of the event",
-    "screen alert minute": "%{smart_count} minute |||| %{smart_count} minutes",
-    "screen alert hour": "%{smart_count} hour |||| %{smart_count} hours",
-    "screen alert day": "%{smart_count} day |||| %{smart_count} days",
-    "screen alert week": "%{smart_count} week |||| %{smart_count} weeks",
-    "screen alert delete tooltip": "Delete alert",
+    "screen alert title empty": "Оповещение",
+    "screen alert title": "%{smart_count} оповещение |||| %{smart_count} оповещений",
+    "screen alert default value": "Добавить оповещение",
+    "screen alert time of event": "Время события",
+    "screen alert minute": "%{smart_count} минута |||| %{smart_count} минут",
+    "screen alert hour": "%{smart_count} час |||| %{smart_count} часов",
+    "screen alert day": "%{smart_count} день |||| %{smart_count} дней",
+    "screen alert week": "%{smart_count} неделя |||| %{smart_count} недель",
+    "screen alert delete tooltip": "Удалить оповещение",
     "screen alert type email": "Email",
-    "screen alert type notification": "Cozy notification",
+    "screen alert type notification": "Cozy уведомление",
     "screen recurrence title": "Повторять",
-    "screen recurrence no repeat": "No repeat",
-    "screen recurrence daily": "Daily",
-    "screen recurrence weekly": "Weekly",
-    "screen recurrence monthly": "Monthly",
-    "screen recurrence yearly": "Yearly",
-    "screen recurrence interval label": "Interval",
-    "screen recurrence interval unit 0": "year |||| years",
-    "screen recurrence interval unit 1": "month |||| months",
-    "screen recurrence interval unit 2": "week |||| weeks",
-    "screen recurrence interval unit 3": "day |||| days",
+    "screen recurrence no repeat": "Без повторений",
+    "screen recurrence daily": "Ежедневно",
+    "screen recurrence weekly": "Еженедельно",
+    "screen recurrence monthly": "Ежемесячно",
+    "screen recurrence yearly": "Ежегодно",
+    "screen recurrence interval label": "Интервал",
+    "screen recurrence interval unit 0": "год |||| года",
+    "screen recurrence interval unit 1": "месяц |||| месяцы",
+    "screen recurrence interval unit 2": "неделя |||| недели",
+    "screen recurrence interval unit 3": "день |||| дней",
     "screen recurrence interval unit": "дни",
-    "screen recurrence days list label": "On days",
-    "screen recurrence repeat by label": "Repeat by",
-    "screen recurrence repeat by month": "Day of the month",
-    "screen recurrence repeat by week": "Day of the week",
-    "screen recurrence ends label": "Ends:",
-    "screen recurrence ends never label": "Never",
+    "screen recurrence days list label": "На днях",
+    "screen recurrence repeat by label": "Повторять по",
+    "screen recurrence repeat by month": "День месяца",
+    "screen recurrence repeat by week": "День недели",
+    "screen recurrence ends label": "Окончание:",
+    "screen recurrence ends never label": "Никогда",
     "screen recurrence ends count label": "После",
-    "screen recurrence ends count unit": "occurrences",
-    "screen recurrence ends until label": "Until",
-    "screen recurrence ends until placeholder": "Until [date]",
-    "screen recurrence summary label": "Summary",
-    "send mails question": "Send a notification email to:",
-    "modal send mails": "Send a notification",
-    "yes": "Yes",
-    "no": "No",
-    "no summary": "A summary must be set.",
-    "start after end": "The start date is after the end date.",
-    "invalid start date": "The start date is invalid.",
-    "invalid end date": "The end date is invalid.",
-    "invalid trigg date": "The date is invalid.",
-    "invalid action": "The action is invalid.",
-    "server error occured": "A server error occured.",
+    "screen recurrence ends count unit": "вхождения",
+    "screen recurrence ends until label": "До",
+    "screen recurrence ends until placeholder": "До [date]",
+    "screen recurrence summary label": "Итог",
+    "send mails question": "Отправить уведомление на email:",
+    "modal send mails": "Отправить уведомление",
+    "accepted": "Принять",
+    "declined": "Отклонить",
+    "need action": "Ответа пока нет",
+    "mail not sent": "Приглашение не отправлено",
+    "yes": "Да",
+    "no": "Нет",
+    "no summary": "Итог должен быть задан.",
+    "start after end": "Дата начала указана после даты окончания.",
+    "invalid start date": "Неверная дата начала.",
+    "invalid end date": "Неверная дата окончания.",
+    "invalid trigg date": "Неверная дата.",
+    "invalid action": "Неверное действие.",
+    "server error occured": "Произошла ошибка сервера.",
     "synchronization": "Синхронизация",
-    "mobile sync": "Mobile Sync (CalDAV)",
-    "link imported events with calendar": "Link events to import with following calendar:",
-    "import an ical file": "To import an ICal file into your cozy calendar, first click on this button to preload it:",
-    "download a copy of your calendar": "Select one calendar and then click on the export button, to download a copy if the calendar as an ICal file, :",
-    "icalendar export": "ICalendar Export",
-    "icalendar import": "ICalendar Import",
-    "to sync your cal with": "To synchronize your calendar with your devices, you must follow two steps",
-    "sync headline with data": "To synchronize your calendar, use the following information:",
+    "mobile sync": "Мобильная синхронизация (CalDAV)",
+    "link imported events with calendar": "Связь событий для импорта со следующим календарем:",
+    "import an ical file": "Для импорта ICal файла в ваш календарь вначале нажмите на эту кнопку для его загрузки:",
+    "download a copy of your calendar": "Выберите календарь и нажмите на кнопку экспорта для скачивания копии календаря в iCal файл:",
+    "icalendar export": "ICalendar Экспорт",
+    "icalendar import": "ICalendar Импорт",
+    "to sync your cal with": "Для синхронизации вашего календаря с устройствами вы долны выполнить два пункта",
+    "sync headline with data": "Для синхронизации вашего календаря используйте следующую инструкцию:",
     "sync url": "URL:",
-    "sync login": "Username:",
-    "sync password": "Password:",
-    "sync help": "Are you lost? Follow the",
-    "sync help link": "step-by-step guide!",
-    "install the sync module": "Install the Sync module from the Cozy App Store",
-    "connect to it and follow": "Connect to it and follow the instructions related to CalDAV.",
-    "some event fail to save": "An event was not saved (an error occured).",
-    "imported events": "Amount of imported events",
-    "import finished": "Your import is now finished. Displaying all new events take time. If you want to load them faster, refresh the whole page.",
-    "import error": "A server error occured, the import failed.",
-    "import error occured for": "Import error occured for following elements:",
-    "export your calendar": "Export your calendar",
-    "please select existing calendar": "Please select an existing calendar.",
+    "sync login": "Имя пользователя:",
+    "sync password": "Пароль:",
+    "sync help": "Вы потерялись? Следуйте",
+    "sync help link": "пошаговым руководством!",
+    "install the sync module": "Установите модуль Синхронизации из магазина Cozy",
+    "connect to it and follow": "Подключите его и следуйте инструкциям по CalDAV. ",
+    "some event fail to save": "Событие не сохранено (возникла ошибка).",
+    "imported events": "Всего импортировано событий",
+    "import finished": "Импорт завершен. Отображение всех новых событий требует времени. Если вы хотите загрузить их быстрее, обновите всю страницу.",
+    "import error": "Произошла ошибка сервера, импорт не удался.",
+    "import error occured for": "Ошибка импорта произошла по элементам:",
+    "export your calendar": "Экспортировать календарь",
+    "please select existing calendar": "Выберите существующий календарь.",
     "January": "Январь",
     "February": "Февраль",
     "March": "Март",
@@ -5459,16 +5678,16 @@ module.exports = {
     "Oct": "Окт.",
     "Nov": "Нояб.",
     "Dec": "Дек.",
-    "calendar exist error": "A calendar named \"New Calendar\" already exists.",
-    "email date format": "MMMM Do YYYY, h:mm a",
+    "calendar exist error": "Календарь \"New Calendar\" уже существует.",
+    "email date format": "MMMM  YYYY, h:mm a",
     "email date format allday": "MMMM Do YYYY, [all day long]",
-    "email invitation title": "Invitation to '%{description}'",
-    "email invitation content": "Hello, I would like to invite you to the following event:\n\n%{description} %{place}\non %{date}\nWould you be there?\n\nYes\n%{url}?status=ACCEPTED&key=%{key}\n\nNo\n%{url}?status=DECLINED&key=%{key}",
-    "email update title": "Event \"%{description}\" has changed",
-    "email update content": "An event you were invited to has changed:\n%{description} %{place}\nOn %{date}\n\nI'm still going\n%{url}?status=ACCEPTED&key=%{key}\n\nI'm not going anymore\n%{url}?status=DECLINED&key=%{key}",
-    "email delete title": "This event has been canceled: %{description}",
-    "email delete content": "This event has been canceled:\n%{description} %{place}\nOn %{date}",
-    "invalid recurring rule": "The recurring rule is invalid"
+    "email invitation title": " Приглашение '%{description}'",
+    "email invitation content": "Здравствуйте, я хотел бы пригласить Вас на следующее событие:\n\n%{description} %{place}\n%{date}\nХотели бы вы быть там?\n\nДа\n%{url}?status=ACCEPTED&key=%{key}\n\nНет\n%{url}?status=DECLINED&key=%{key}",
+    "email update title": "Событие \"%{description}\" было изменено",
+    "email update content": "Событие, на которое вы были приглашены, изменилось\n%{description} %{place}\n%{date}\n\nЯ все равно буду\n%{url}?status=ACCEPTED&key=%{key}\n\nЯ не смогу\n%{url}?status=DECLINED&key=%{key}",
+    "email delete title": "Это мероприятие отменено: %{description}",
+    "email delete content": "Это мероприятие было отменено:\n%{description} %{place}\n%{date}",
+    "invalid recurring rule": "Повторяющееся правило неверно"
 };
 });
 
@@ -5612,6 +5831,11 @@ module.exports = {
     "duplicate event tooltip": "Duplicate event",
     "delete event tooltip": "Delete event",
     "change calendar": "Change calendar",
+    "screen confirm title": "Are you sure?",
+    "screen confirm description": "The change you made in this popover will be lost.",
+    "screen confirm yes button": "Don't save",
+    "screen confirm no button": "Cancel",
+    "dont ask again": "Dont ask for confirmation when exiting the popover.",
     "screen delete title": "Delete event",
     "screen delete description": "You are about to delete the event \"%{description}\". Are you sure?",
     "screen delete yes button": "Yes",
@@ -5658,6 +5882,10 @@ module.exports = {
     "screen recurrence summary label": "Summary",
     "send mails question": "Send a notification email to:",
     "modal send mails": "Send a notification",
+    "accepted": "Accepted",
+    "declined": "Declined",
+    "need action": "No answer yet",
+    "mail not sent": "No invitation sent",
     "yes": "Yes",
     "no": "No",
     "no summary": "A summary must be set.",
@@ -5975,14 +6203,15 @@ module.exports = ScheduleItem = (function(superClass) {
 
   ScheduleItem.prototype.getCalendar = function() {
     var ref;
-    return app.tags.getByName((ref = this.get('tags')) != null ? ref[0] : void 0);
+    return this.calendar || app.calendars.getByName((ref = this.get('tags')) != null ? ref[0] : void 0);
   };
 
-  ScheduleItem.prototype.setCalendar = function(cal) {
+  ScheduleItem.prototype.setCalendar = function(calendar) {
     var oldTags, tags;
     oldTags = this.get('tags');
     tags = oldTags != null ? [].concat(oldTags) : [];
-    tags[0] = cal;
+    tags[0] = calendar.get('name');
+    this.calendar = calendar;
     return this.set({
       tags: tags
     });
@@ -6243,9 +6472,11 @@ module.exports = ScheduleItem = (function(superClass) {
   };
 
   ScheduleItem.prototype.sync = function(method, model, options) {
+    var frozenModel;
+    frozenModel = model.clone();
     return this.confirmSendEmails(method, function(sendMails) {
       options.url = (model.url()) + "?sendMails=" + sendMails;
-      return ScheduleItem.__super__.sync.call(this, method, model, options);
+      return ScheduleItem.__super__.sync.call(this, method, frozenModel, options);
     });
   };
 
@@ -6270,20 +6501,75 @@ module.exports = ScheduleItem = (function(superClass) {
         }
       };
     })(this)).map(function(guest) {
-      return guest.email;
+      return guest.label;
     });
     if (guestsToInform.length === 0) {
-      callback(false);
+      return callback(false);
     } else {
       guestsList = guestsToInform.join(', ');
-      content = (t('send mails question')) + " " + guestsList;
+      content = (t('send invitations question')) + " " + guestsList;
       Modal.confirm(t('modal send mails'), content, t('yes'), t('no'), callback);
     }
     this.startDateChanged = false;
     return this.attendeesChanged = false;
   };
 
+  ScheduleItem.prototype.isShared = function() {
+    return this.get('shareID') != null;
+  };
+
   return ScheduleItem;
+
+})(Backbone.Model);
+});
+
+;require.register("models/sharing.coffee", function(exports, require, module) {
+var Sharing, request,
+  extend = function(child, parent) { for (var key in parent) { if (hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; },
+  hasProp = {}.hasOwnProperty;
+
+request = require('lib/request');
+
+module.exports = Sharing = (function(superClass) {
+  extend(Sharing, superClass);
+
+  function Sharing() {
+    return Sharing.__super__.constructor.apply(this, arguments);
+  }
+
+  Sharing.prototype.urlRoot = 'sharings';
+
+  Sharing.prototype.accept = function(callback) {
+    var id;
+    id = this.get('id');
+    return request.post('sharing/accept', this.toJSON(), (function(_this) {
+      return function(err, response) {
+        if (err) {
+          return callback(err, null);
+        } else {
+          callback(null, response);
+          return _this.trigger('accepted', _this);
+        }
+      };
+    })(this));
+  };
+
+  Sharing.prototype.refuse = function(callback) {
+    var id;
+    id = this.get('id');
+    return request.post('sharing/refuse', this.toJSON(), (function(_this) {
+      return function(err, response) {
+        if (err) {
+          return callback(err, null);
+        } else {
+          callback(null, response);
+          return _this.trigger('refused', _this);
+        }
+      };
+    })(this));
+  };
+
+  return Sharing;
 
 })(Backbone.Model);
 });
@@ -6358,9 +6644,6 @@ module.exports = Router = (function(superClass) {
     'month': 'month',
     'month/:year/:month': 'month',
     'month/:year/:month/:eventid': 'month_event',
-    'week': 'week',
-    'week/:year/:month/:day': 'week',
-    'week/:year/:month/:day/:eventid': 'week_event',
     'list': 'list',
     'list/:eventid': 'list_event',
     'event/:eventid': 'auto_event',
@@ -6370,9 +6653,10 @@ module.exports = Router = (function(superClass) {
 
   Router.prototype.initialize = function(options) {
     Router.__super__.initialize.call(this, options);
+    this.isMobile = options != null ? options.isMobile : void 0;
     return $(window).resize((function(_this) {
       return function() {
-        if (window.app.isMobile()) {
+        if (_this.isMobile) {
           return _this.navigate('list', {
             trigger: true
           });
@@ -6382,7 +6666,7 @@ module.exports = Router = (function(superClass) {
   };
 
   Router.prototype.navigate = function(route, options) {
-    if (window.app.isMobile()) {
+    if (this.isMobile) {
       return Router.__super__.navigate.call(this, 'list', options);
     } else {
       return Router.__super__.navigate.call(this, route, options);
@@ -6406,26 +6690,9 @@ module.exports = Router = (function(superClass) {
     }
   };
 
-  Router.prototype.week = function(year, month, day) {
-    var hash, monthToLoad, ref;
-    if (year != null) {
-      ref = getBeginningOfWeek(year, month, day), year = ref[0], month = ref[1], day = ref[2];
-      monthToLoad = moment(year + "/" + month, "YYYY/M");
-      return window.app.events.loadMonth(monthToLoad, (function(_this) {
-        return function() {
-          return _this.displayCalendar('agendaWeek', year, month, day);
-        };
-      })(this));
-    } else {
-      hash = moment().format('[week]/YYYY/M/D');
-      return this.navigate(hash, {
-        trigger: true
-      });
-    }
-  };
-
   Router.prototype.list = function() {
     this.displayView(new ListView({
+      isMobile: this.isMobile,
       collection: new DayBucketCollection()
     }));
     app.menu.activate('calendar');
@@ -6448,15 +6715,6 @@ module.exports = Router = (function(superClass) {
       this.month(year, month);
     }
     return this.event(id, "month/" + year + "/" + month);
-  };
-
-  Router.prototype.week_event = function(year, month, date, id) {
-    var day, ref;
-    ref = getBeginningOfWeek(year, month, day), year = ref[0], month = ref[1], day = ref[2];
-    if (!(this.mainView instanceof CalendarView)) {
-      this.week(year, month, date);
-    }
-    return this.event(id, "week/" + year + "/" + month + "/" + date);
   };
 
   Router.prototype.list_event = function(id) {
@@ -6482,7 +6740,8 @@ module.exports = Router = (function(superClass) {
       date: parseInt(day),
       view: view,
       model: {
-        events: app.events
+        events: app.events,
+        pendingEventSharingsCollection: app.pendingEventSharings
       }
     }));
     app.menu.activate('calendar');
@@ -6534,17 +6793,13 @@ module.exports = CalendarHeader = (function(superClass) {
   CalendarHeader.prototype.template = require('./templates/calendar_header');
 
   CalendarHeader.prototype.initialize = function(options) {
-    return this.cal = options != null ? options.cal : void 0;
+    this.cal = options != null ? options.cal : void 0;
+    return this.isMobile = options != null ? options.isMobile : void 0;
   };
 
   CalendarHeader.prototype.getViewName = function() {
-    var view;
     if (this.cal == null) {
       return 'list';
-    }
-    view = this.cal.fullCalendar('getView');
-    if (view.name === 'agendaWeek') {
-      return 'week';
     }
     return 'month';
   };
@@ -6584,6 +6839,7 @@ module.exports = CalendarHeader = (function(superClass) {
       title: this.getTitle(),
       todaytxt: t('today'),
       calendarMode: this.cal != null,
+      isMobile: this.isMobile,
       active: (function(_this) {
         return function(item) {
           if (item === 'today' && _this.isToday() || item === _this.getViewName()) {
@@ -6614,11 +6870,6 @@ module.exports = CalendarHeader = (function(superClass) {
       'click .fc-button-month': (function(_this) {
         return function() {
           return _this.trigger('month');
-        };
-      })(this),
-      'click .fc-button-week': (function(_this) {
-        return function() {
-          return _this.trigger('week');
         };
       })(this),
       'click .fc-button-list': (function(_this) {
@@ -6677,6 +6928,7 @@ module.exports = EventPopOver = (function(superClass) {
   };
 
   EventPopOver.prototype.initialize = function(options) {
+    console.debug('CalendarEventPopover.initialize');
     if (!this.model) {
       this.model = new Event({
         start: this.momentToString(options.start),
@@ -6685,7 +6937,9 @@ module.exports = EventPopOver = (function(superClass) {
         place: ''
       });
     }
-    this.listenToOnce(this.model, 'change', (function(_this) {
+    this.context = {};
+    this.context.formModel = this.model.clone();
+    this.listenToOnce(this.context.formModel, 'change', (function(_this) {
       return function() {
         return _this.modelHasChanged = true;
       };
@@ -6767,8 +7021,32 @@ module.exports = EventPopOver = (function(superClass) {
 })(PopoverView);
 });
 
+;require.register("views/calendar_popover_screen_event.coffee", function(exports, require, module) {
+var EventPopoverScreenView, PopoverScreenView,
+  extend = function(child, parent) { for (var key in parent) { if (hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; },
+  hasProp = {}.hasOwnProperty;
+
+PopoverScreenView = require('lib/popover_screen_view');
+
+module.exports = EventPopoverScreenView = (function(superClass) {
+  extend(EventPopoverScreenView, superClass);
+
+  function EventPopoverScreenView() {
+    return EventPopoverScreenView.__super__.constructor.apply(this, arguments);
+  }
+
+  EventPopoverScreenView.prototype.initialize = function() {
+    EventPopoverScreenView.__super__.initialize.call(this);
+    return this.formModel = this.context.formModel;
+  };
+
+  return EventPopoverScreenView;
+
+})(PopoverScreenView);
+});
+
 ;require.register("views/calendar_view.coffee", function(exports, require, module) {
-var BaseView, CalendarView, Event, EventPopover, Header, app, helpers, timezones,
+var BaseView, CalendarView, Event, EventPopover, EventSharingButtonView, Header, app, helpers, timezones,
   bind = function(fn, me){ return function(){ return fn.apply(me, arguments); }; },
   extend = function(child, parent) { for (var key in parent) { if (hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; },
   hasProp = {}.hasOwnProperty,
@@ -6779,6 +7057,8 @@ app = require('application');
 BaseView = require('lib/base_view');
 
 EventPopover = require('./calendar_popover_event');
+
+EventSharingButtonView = require('./pending_event_sharings_button');
 
 Header = require('./calendar_header');
 
@@ -6814,9 +7094,17 @@ module.exports = CalendarView = (function(superClass) {
     this.listenTo(this.eventCollection, 'reset', this.refresh);
     this.listenTo(this.eventCollection, 'remove', this.onRemove);
     this.listenTo(this.eventCollection, 'change', this.refreshOne);
-    this.model = null;
     this.calendarsCollection = app.calendars;
-    return this.listenTo(this.calendarsCollection, 'change', this.refresh);
+    this.listenTo(this.calendarsCollection, 'change', this.onCalendarCollectionChange);
+    this.eventSharingButtonView = new EventSharingButtonView({
+      collection: this.model.pendingEventSharingsCollection
+    });
+    return this.model = null;
+  };
+
+  CalendarView.prototype.render = function() {
+    CalendarView.__super__.render.call(this);
+    return this.eventSharingButtonView.snap(this).render();
   };
 
   CalendarView.prototype.afterRender = function() {
@@ -6849,13 +7137,11 @@ module.exports = CalendarView = (function(superClass) {
       buttonText: {
         today: t('today'),
         month: t('month'),
-        week: t('week'),
         day: t('day')
       },
       timezone: window.app.timezone,
       timeFormat: '',
       columnFormat: {
-        'week': 'ddd D',
         'month': 'dddd'
       },
       axisFormat: 'H:mm',
@@ -6900,11 +7186,6 @@ module.exports = CalendarView = (function(superClass) {
     this.calHeader.on('today', (function(_this) {
       return function() {
         return _this.cal.fullCalendar('today');
-      };
-    })(this));
-    this.calHeader.on('week', (function(_this) {
-      return function() {
-        return _this.cal.fullCalendar('changeView', 'agendaWeek');
       };
     })(this));
     this.calHeader.on('month', (function(_this) {
@@ -6952,6 +7233,10 @@ module.exports = CalendarView = (function(superClass) {
     return this.cal.fullCalendar('refetchEvents');
   };
 
+  CalendarView.prototype.onCalendarCollectionChange = function(collection) {
+    return this.refresh(collection);
+  };
+
   CalendarView.prototype.onRemove = function(model) {
     return this.cal.fullCalendar('removeEvents', model.cid);
   };
@@ -6973,8 +7258,9 @@ module.exports = CalendarView = (function(superClass) {
     fcEvent = this.cal.fullCalendar('clientEvents', data.id)[0];
     if (fcEvent != null) {
       _.extend(fcEvent, data);
-      return this.cal.fullCalendar('updateEvent', fcEvent);
+      this.cal.fullCalendar('updateEvent', fcEvent);
     }
+    return this.refresh();
   };
 
   CalendarView.prototype.showPopover = function(options) {
@@ -7002,7 +7288,7 @@ module.exports = CalendarView = (function(superClass) {
   };
 
   CalendarView.prototype.onChangeView = function(view) {
-    var f, hash, ref;
+    var hash, ref;
     this.closePopover();
     if ((ref = this.calHeader) != null) {
       ref.render();
@@ -7011,18 +7297,12 @@ module.exports = CalendarView = (function(superClass) {
       this.handleWindowResize();
     }
     this.view = view.name;
-    f = this.view === 'month' ? '[month]/YYYY/M' : '[week]/YYYY/M/D';
-    hash = view.intervalStart.format(f);
+    hash = view.intervalStart.format('[month]/YYYY/M');
     return app.router.navigate(hash);
   };
 
   CalendarView.prototype.getUrlHash = function() {
-    switch (this.cal.fullCalendar('getView').name) {
-      case 'month':
-        return 'calendar';
-      case 'agendaWeek':
-        return 'calendarweek';
-    }
+    return 'calendar';
   };
 
   CalendarView.prototype.onSelect = function(startDate, endDate, jsEvent, view) {
@@ -7132,6 +7412,37 @@ module.exports = CalendarView = (function(superClass) {
   return CalendarView;
 
 })(BaseView);
+});
+
+;require.register("views/collection_counter.coffee", function(exports, require, module) {
+var CollectionCounterView, CollectionView,
+  extend = function(child, parent) { for (var key in parent) { if (hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; },
+  hasProp = {}.hasOwnProperty;
+
+CollectionView = require('lib/view_collection');
+
+module.exports = CollectionCounterView = (function(superClass) {
+  extend(CollectionCounterView, superClass);
+
+  function CollectionCounterView() {
+    return CollectionCounterView.__super__.constructor.apply(this, arguments);
+  }
+
+  CollectionCounterView.prototype.className = 'collection-counter';
+
+  CollectionCounterView.prototype.template = require('./templates/collection_counter');
+
+  CollectionCounterView.prototype.initialize = function(options) {
+    CollectionCounterView.__super__.initialize.call(this, options);
+    this.stopListening(this.collection);
+    return this.listenTo(this.collection, 'add remove reset', this.render);
+  };
+
+  CollectionCounterView.prototype.afterRender = function() {};
+
+  return CollectionCounterView;
+
+})(CollectionView);
 });
 
 ;require.register("views/import_event_list.coffee", function(exports, require, module) {
@@ -7457,16 +7768,18 @@ module.exports = ListView = (function(superClass) {
     'click .showbefore': 'loadBefore'
   };
 
+  ListView.prototype.initialize = function(options) {
+    this.isMobile = options != null ? options.isMobile : void 0;
+    return ListView.__super__.initialize.apply(this, arguments);
+  };
+
   ListView.prototype.afterRender = function() {
-    this.calHeader = new Header();
+    this.calHeader = new Header({
+      isMobile: this.isMobile
+    });
     this.$('#calheader').html(this.calHeader.render().$el);
     this.calHeader.on('month', function() {
       return app.router.navigate('', {
-        trigger: true
-      });
-    });
-    this.calHeader.on('week', function() {
-      return app.router.navigate('week', {
         trigger: true
       });
     });
@@ -7844,6 +8157,7 @@ module.exports = MenuView = (function(superClass) {
       wait: true,
       success: function() {
         var wait;
+        app.calendars.add(app.tags.getOrCreateByName(name));
         return wait = setInterval(function() {
           var newCalSel, rename;
           newCalSel = "#menuitems li.tagmenuitem[data-name='" + name + "']";
@@ -7948,6 +8262,11 @@ module.exports = MenuItemView = (function(superClass) {
     'keyup input.calendar-name': 'onRenameValidation'
   };
 
+  MenuItemView.prototype.initialize = function() {
+    MenuItemView.__super__.initialize.call(this);
+    return this.listenTo(this.model, 'change', this.onCalendarChange);
+  };
+
   MenuItemView.prototype.getRenderData = function() {
     return {
       label: this.model.get('name'),
@@ -8027,19 +8346,30 @@ module.exports = MenuItemView = (function(superClass) {
     }
   };
 
+  MenuItemView.prototype.onCalendarChange = function() {
+    if (this.rawTextElement && this.model.hasChanged('name')) {
+      this.rawTextElement.html(this.model.get('name'));
+    }
+    if (this.model.hasChanged('color')) {
+      return this.model.save();
+    }
+  };
+
   MenuItemView.prototype.onRenameValidation = function(event) {
     var calendarName, input, key;
     input = $(event.target);
     calendarName = this.model.get('name');
     key = event.keyCode || event.charCode;
     if (key === 27) {
-      return this.hideInput(input, calendarName);
+      return this.hideInput(input);
     } else if (key === 13 || event.type === 'focusout') {
       this.showLoading();
       return app.calendars.rename(calendarName, input.val(), (function(_this) {
-        return function() {
+        return function(name) {
+          _this.model.set('name', name);
+          _this.model.set('color', ColorHash.getColor(name, 'color'));
           _this.hideLoading();
-          return _this.hideInput(input, calendarName);
+          return _this.hideInput(input);
         };
       })(this));
     } else {
@@ -8078,7 +8408,7 @@ module.exports = MenuItemView = (function(superClass) {
   MenuItemView.prototype.hideInput = function(input, calendarName) {
     input.remove();
     this.rawTextElement.insertAfter(this.$('.badge'));
-    this.buildBadge(calendarName);
+    this.buildBadge(this.model.get('color'));
     return this.$('.dropdown-toggle').show();
   };
 
@@ -8116,12 +8446,154 @@ module.exports = MenuItemView = (function(superClass) {
 })(BaseView);
 });
 
-;require.register("views/popover_screens/alert.coffee", function(exports, require, module) {
-var AlertPopoverScreen, PopoverScreenView, helpers,
+;require.register("views/pending_event_sharings_button.coffee", function(exports, require, module) {
+var CollectionCounterView, CollectionView, PendingEventSharingsButtonView, PopupView,
   extend = function(child, parent) { for (var key in parent) { if (hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; },
   hasProp = {}.hasOwnProperty;
 
-PopoverScreenView = require('lib/popover_screen_view');
+CollectionView = require('lib/view_collection');
+
+CollectionCounterView = require('./collection_counter');
+
+PopupView = require('lib/popup_view');
+
+module.exports = PendingEventSharingsButtonView = (function(superClass) {
+  extend(PendingEventSharingsButtonView, superClass);
+
+  function PendingEventSharingsButtonView() {
+    return PendingEventSharingsButtonView.__super__.constructor.apply(this, arguments);
+  }
+
+  PendingEventSharingsButtonView.prototype.id = 'shared-events-button';
+
+  PendingEventSharingsButtonView.prototype.template = require('./templates/pending_event_sharings_button');
+
+  PendingEventSharingsButtonView.prototype.itemview = require('./pending_event_sharings_button_item');
+
+  PendingEventSharingsButtonView.prototype.collectionEl = '#shared-events-popup';
+
+  PendingEventSharingsButtonView.prototype.events = {
+    'click button': 'togglePopup',
+    'keyup': 'onKeyUp'
+  };
+
+  PendingEventSharingsButtonView.prototype.initialize = function() {
+    PendingEventSharingsButtonView.__super__.initialize.call(this);
+    return this.counterView = new CollectionCounterView({
+      collection: this.collection
+    });
+  };
+
+  PendingEventSharingsButtonView.prototype.togglePopup = function(display) {
+    return this.popup && this.popup.toggle();
+  };
+
+  PendingEventSharingsButtonView.prototype.render = function() {
+    PendingEventSharingsButtonView.__super__.render.apply(this, arguments);
+    return this.counterView.snap(this).render();
+  };
+
+  PendingEventSharingsButtonView.prototype.afterRender = function() {
+    PendingEventSharingsButtonView.__super__.afterRender.apply(this, arguments);
+    return this.popup = new PopupView({
+      el: this.$(this.collectionEl),
+      anchor: this.$el
+    });
+  };
+
+  PendingEventSharingsButtonView.prototype.addItem = function(model) {
+    this.$el.show();
+    return PendingEventSharingsButtonView.__super__.addItem.call(this, model);
+  };
+
+  PendingEventSharingsButtonView.prototype.removeItem = function(model) {
+    PendingEventSharingsButtonView.__super__.removeItem.call(this, model);
+    if (this.collection.length === 0) {
+      return this.$el.hide();
+    }
+  };
+
+  PendingEventSharingsButtonView.prototype.onKeyUp = function(event) {
+    var keys;
+    keys = {
+      ESC: 27
+    };
+    if (event.keyCode === keys.ESC) {
+      return this.withdraw;
+    }
+  };
+
+  PendingEventSharingsButtonView.prototype.withdraw = function() {
+    return this.togglePopup(false);
+  };
+
+  return PendingEventSharingsButtonView;
+
+})(CollectionView);
+});
+
+;require.register("views/pending_event_sharings_button_item.coffee", function(exports, require, module) {
+var BaseView, PendingEventSharingsButtonItemView,
+  extend = function(child, parent) { for (var key in parent) { if (hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; },
+  hasProp = {}.hasOwnProperty;
+
+BaseView = require('lib/base_view');
+
+module.exports = PendingEventSharingsButtonItemView = (function(superClass) {
+  extend(PendingEventSharingsButtonItemView, superClass);
+
+  function PendingEventSharingsButtonItemView() {
+    return PendingEventSharingsButtonItemView.__super__.constructor.apply(this, arguments);
+  }
+
+  PendingEventSharingsButtonItemView.prototype.className = 'event-sharings-button-item';
+
+  PendingEventSharingsButtonItemView.prototype.template = require('./templates/pending_event_sharings_button_item');
+
+  PendingEventSharingsButtonItemView.prototype.events = {
+    'click .accept': 'onAccept',
+    'click .decline': 'onDecline'
+  };
+
+  PendingEventSharingsButtonItemView.prototype.initialize = function() {
+    return this.listenTo(this.model, 'accepted refused', this.destroy);
+  };
+
+  PendingEventSharingsButtonItemView.prototype.onAccept = function() {
+    return this.model.accept((function(_this) {
+      return function(err) {
+        if (err) {
+          return _this.onAnswerError(err);
+        }
+      };
+    })(this));
+  };
+
+  PendingEventSharingsButtonItemView.prototype.onDecline = function() {
+    return this.model.refuse((function(_this) {
+      return function(err) {
+        if (err) {
+          return _this.onAnswerError(err);
+        }
+      };
+    })(this));
+  };
+
+  PendingEventSharingsButtonItemView.prototype.onAnswerError = function(err) {
+    return console.error(err);
+  };
+
+  return PendingEventSharingsButtonItemView;
+
+})(BaseView);
+});
+
+;require.register("views/popover_screens/alert.coffee", function(exports, require, module) {
+var AlertPopoverScreen, EventPopoverScreenView, helpers,
+  extend = function(child, parent) { for (var key in parent) { if (hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; },
+  hasProp = {}.hasOwnProperty;
+
+EventPopoverScreenView = require('views/calendar_popover_screen_event');
 
 helpers = require('helpers');
 
@@ -8174,7 +8646,7 @@ module.exports = AlertPopoverScreen = (function(superClass) {
 
   AlertPopoverScreen.prototype.getRenderData = function() {
     var alertOptions, alerts, formattedAlertOptions, numAlerts;
-    alerts = this.model.get('alarms') || [];
+    alerts = this.formModel.get('alarms') || [];
     numAlerts = alerts.length;
     if (numAlerts > 0) {
       this.screenTitle = t('screen alert title', {
@@ -8195,7 +8667,7 @@ module.exports = AlertPopoverScreen = (function(superClass) {
     })(this));
     return _.extend(AlertPopoverScreen.__super__.getRenderData.call(this), {
       alertOptions: formattedAlertOptions,
-      alerts: this.model.get('alarms')
+      alerts: this.formModel.get('alarms')
     });
   };
 
@@ -8203,7 +8675,7 @@ module.exports = AlertPopoverScreen = (function(superClass) {
     var $alerts, alarm, alarms, i, index, len, options, ref, ref1, ref2, results, row, translationKey, trigger, value;
     $alerts = this.$('.alerts');
     $alerts.empty();
-    alarms = this.model.get('alarms') || [];
+    alarms = this.formModel.get('alarms') || [];
     results = [];
     for (index = i = 0, len = alarms.length; i < len; index = ++i) {
       alarm = alarms[index];
@@ -8227,9 +8699,9 @@ module.exports = AlertPopoverScreen = (function(superClass) {
   AlertPopoverScreen.prototype.onRemoveAlert = function(event) {
     var alerts, index;
     index = this.$(event.target).parents('li').attr('data-index');
-    alerts = this.model.get('alarms') || [];
+    alerts = this.formModel.get('alarms') || [];
     alerts.splice(index, 1);
-    this.model.set('alarms', alerts);
+    this.formModel.set('alarms', alerts);
     return this.render();
   };
 
@@ -8240,7 +8712,7 @@ module.exports = AlertPopoverScreen = (function(superClass) {
     action = isEmailAction ? 'EMAIL' : 'DISPLAY';
     otherAction = action === 'EMAIL' ? 'DISPLAY' : 'EMAIL';
     index = checkbox.parents('li').attr('data-index');
-    alerts = this.model.get('alarms');
+    alerts = this.formModel.get('alarms');
     currentAction = alerts[index].action;
     if (currentAction === 'BOTH') {
       newAction = otherAction;
@@ -8251,7 +8723,7 @@ module.exports = AlertPopoverScreen = (function(superClass) {
     }
     if (newAction != null) {
       alerts[index].action = newAction;
-      return this.model.set('alarms', alerts);
+      return this.formModel.set('alarms', alerts);
     }
   };
 
@@ -8261,12 +8733,12 @@ module.exports = AlertPopoverScreen = (function(superClass) {
     if (index !== -1) {
       alertOption = AlertPopoverScreen.ALERT_OPTIONS[index];
       triggerValue = helpers.unitValuesToiCalDuration(alertOption);
-      alarms = this.model.get('alarms') || [];
+      alarms = this.formModel.get('alarms') || [];
       alarms.push({
         action: 'DISPLAY',
         trigg: triggerValue
       });
-      this.model.set('alarms', alarms);
+      this.formModel.set('alarms', alarms);
       this.$('select.new-alert').val(-1);
       return this.render();
     }
@@ -8299,7 +8771,7 @@ module.exports = AlertPopoverScreen = (function(superClass) {
 
   return AlertPopoverScreen;
 
-})(PopoverScreenView);
+})(EventPopoverScreenView);
 });
 
 ;require.register("views/popover_screens/confirm.coffee", function(exports, require, module) {
@@ -8408,11 +8880,11 @@ module.exports = DeletePopoverScreen = (function(superClass) {
 });
 
 ;require.register("views/popover_screens/details.coffee", function(exports, require, module) {
-var DetailsPopoverScreen, PopoverScreenView,
+var DetailsPopoverScreen, EventPopoverScreenView,
   extend = function(child, parent) { for (var key in parent) { if (hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; },
   hasProp = {}.hasOwnProperty;
 
-PopoverScreenView = require('lib/popover_screen_view');
+EventPopoverScreenView = require('views/calendar_popover_screen_event');
 
 module.exports = DetailsPopoverScreen = (function(superClass) {
   extend(DetailsPopoverScreen, superClass);
@@ -8432,20 +8904,26 @@ module.exports = DetailsPopoverScreen = (function(superClass) {
   DetailsPopoverScreen.prototype.onLeaveScreen = function() {
     var value;
     value = this.$('.input-details').val();
-    return this.model.set('details', value);
+    return this.formModel.set('details', value);
+  };
+
+  DetailsPopoverScreen.prototype.getRenderData = function() {
+    return {
+      details: this.formModel.get('details')
+    };
   };
 
   return DetailsPopoverScreen;
 
-})(PopoverScreenView);
+})(EventPopoverScreenView);
 });
 
 ;require.register("views/popover_screens/guests.coffee", function(exports, require, module) {
-var GuestPopoverScreen, PopoverScreenView, random,
+var EventPopoverScreenView, GuestPopoverScreen, random,
   extend = function(child, parent) { for (var key in parent) { if (hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; },
   hasProp = {}.hasOwnProperty;
 
-PopoverScreenView = require('lib/popover_screen_view');
+EventPopoverScreenView = require('views/calendar_popover_screen_event');
 
 random = require('lib/random');
 
@@ -8465,12 +8943,14 @@ module.exports = GuestPopoverScreen = (function(superClass) {
   GuestPopoverScreen.prototype.events = {
     "click .add-new-guest": "onNewGuest",
     "click .guest-delete": "onRemoveGuest",
+    "click .guest-share-with-cozy": "onShareWithCozy",
+    "click .guest-share-with-email": "onShareWithEmail",
     'keyup input[name="guest-name"]': "onKeyup"
   };
 
   GuestPopoverScreen.prototype.getRenderData = function() {
     var guests, numGuests;
-    guests = this.model.get('attendees') || [];
+    guests = this.formModel.get('attendees') || [];
     numGuests = guests.length;
     if (numGuests > 0) {
       this.screenTitle = t('screen guest title', {
@@ -8480,7 +8960,7 @@ module.exports = GuestPopoverScreen = (function(superClass) {
       this.screenTitle = t('screen guest title empty');
     }
     return _.extend(GuestPopoverScreen.__super__.getRenderData.call(this), {
-      guests: this.model.get('attendes') || []
+      guests: this.formModel.get('attendes') || []
     });
   };
 
@@ -8488,7 +8968,7 @@ module.exports = GuestPopoverScreen = (function(superClass) {
     var $guests, guest, guests, i, index, len, options, row;
     $guests = this.$('.guests');
     $guests.empty();
-    guests = this.model.get('attendees') || [];
+    guests = this.formModel.get('attendees') || [];
     for (index = i = 0, len = guests.length; i < len; index = ++i) {
       guest = guests[index];
       options = _.extend(guest, {
@@ -8540,14 +9020,38 @@ module.exports = GuestPopoverScreen = (function(superClass) {
   GuestPopoverScreen.prototype.onRemoveGuest = function(event) {
     var guests, index;
     index = this.$(event.target).parents('li').attr('data-index');
-    guests = this.model.get('attendees') || [];
+    guests = this.formModel.get('attendees') || [];
     guests.splice(index, 1);
-    this.model.set('attendees', guests);
+    this.formModel.set('attendees', guests);
+    return this.render();
+  };
+
+  GuestPopoverScreen.prototype.onShareWithCozy = function(event) {
+    var guest, guests, index;
+    index = this.$(event.target).parents('li').attr('data-index');
+    guests = this.formModel.get('attendees') || [];
+    guests = _.clone(guests);
+    guest = guests[index];
+    guest.shareWithCozy = true;
+    guest.label = "Cozy: " + guest.name;
+    this.formModel.set('attendees', guests);
+    return this.render();
+  };
+
+  GuestPopoverScreen.prototype.onShareWithEmail = function(event) {
+    var guest, guests, index;
+    index = this.$(event.target).parents('li').attr('data-index');
+    guests = this.formModel.get('attendees') || [];
+    guests = _.clone(guests);
+    guest = guests[index];
+    guest.shareWithCozy = false;
+    guest.label = guest.email;
+    this.formModel.set('attendees', guests);
     return this.render();
   };
 
   GuestPopoverScreen.prototype.onNewGuest = function(userInfo) {
-    var contactID, email, guests, ref;
+    var contact, contactID, email, guests, ref;
     if (userInfo == null) {
       userInfo = null;
     }
@@ -8559,18 +9063,23 @@ module.exports = GuestPopoverScreen = (function(superClass) {
     }
     email = email.trim();
     if (email.length > 0) {
-      guests = this.model.get('attendees') || [];
+      guests = this.formModel.get('attendees') || [];
       if (!_.findWhere(guests, {
         email: email
       })) {
+        contact = app.contacts.get(contactID);
         guests = _.clone(guests);
         guests.push({
           key: random.randomString(),
           status: 'INVITATION-NOT-SENT',
           email: email,
-          contactid: contactID
+          label: email,
+          contactid: contactID,
+          cozy: contact.get('cozy'),
+          name: contact.get('name'),
+          shareWithCozy: false
         });
-        this.model.set('attendees', guests);
+        this.formModel.set('attendees', guests);
         this.render();
       }
     }
@@ -8588,7 +9097,7 @@ module.exports = GuestPopoverScreen = (function(superClass) {
 
   return GuestPopoverScreen;
 
-})(PopoverScreenView);
+})(EventPopoverScreenView);
 });
 
 ;require.register("views/popover_screens/main.coffee", function(exports, require, module) {
@@ -8646,6 +9155,8 @@ module.exports = MainPopoverScreen = (function(superClass) {
 
   MainPopoverScreen.prototype.events = {
     'keyup': 'onKeyUp',
+    'keyup button': 'stopKeyUpPropagation',
+    'keyup [role=button]': 'stopKeyUpPropagation',
     'change select': 'onKeyUp',
     'change input': 'onKeyUp',
     'click .cancel': 'onCancelClicked',
@@ -8667,10 +9178,7 @@ module.exports = MainPopoverScreen = (function(superClass) {
     'click .input-people': function() {
       return this.switchToScreen('guests');
     },
-    'click .input-details-row': function() {
-      return this.switchToScreen('details');
-    },
-    'click .input-details-trigger': function() {
+    'click .input-details': function() {
       return this.switchToScreen('details');
     },
     'click .input-alert': function() {
@@ -8682,12 +9190,16 @@ module.exports = MainPopoverScreen = (function(superClass) {
   };
 
   MainPopoverScreen.prototype.initialize = function() {
-    this.listenTo(this.model, "change:start", this.onStartChange);
-    return this.listenTo(this.model, "change:end", this.onEndChange);
+    this.formModel = this.context.formModel;
+    this.listenTo(this.formModel, "change:start", this.onStartChange);
+    this.listenTo(this.formModel, "change:end", this.onEndChange);
+    this.calendar = this.formModel.getCalendar();
+    this.listenTo(this.calendar, 'change:color', this.onCalendarColorChange);
+    return this.listenTo(app.calendars, 'change', this.onCalendarsChange);
   };
 
   MainPopoverScreen.prototype.onLeaveScreen = function() {
-    return this.stopListening(this.model);
+    return this.stopListening(this.formModel);
   };
 
   MainPopoverScreen.prototype.getRenderData = function() {
@@ -8697,19 +9209,22 @@ module.exports = MainPopoverScreen = (function(superClass) {
     if (this.model.isNew()) {
       currentCalendar = firstCalendar || defaultCalendar;
     } else {
-      currentCalendar = ((ref2 = this.model.get('tags')) != null ? ref2[0] : void 0) || defaultCalendar;
+      currentCalendar = ((ref2 = this.formModel.get('tags')) != null ? ref2[0] : void 0) || defaultCalendar;
     }
-    endOffset = this.model.isAllDay() ? -1 : 0;
+    endOffset = this.formModel.isAllDay() ? -1 : 0;
     return data = _.extend(MainPopoverScreen.__super__.getRenderData.call(this), {
       tFormat: tFormat,
       dFormat: dFormat,
       calendar: currentCalendar,
-      allDay: this.model.isAllDay(),
-      sameDay: this.model.isSameDay(),
-      start: this.model.getStartDateObject(),
-      end: this.model.getEndDateObject().add(endOffset, 'd'),
-      alerts: this.model.get('alarms'),
+      place: this.formModel.get('place'),
+      description: this.formModel.get('description'),
+      allDay: this.formModel.isAllDay(),
+      sameDay: this.formModel.isSameDay(),
+      start: this.formModel.getStartDateObject(),
+      end: this.formModel.getEndDateObject().add(endOffset, 'd'),
+      alerts: this.formModel.get('alarms'),
       guestsButtonText: this.getGuestsButtonText(),
+      detailsButtonText: this.getDetailsButtonText(),
       buttonText: this.getButtonText(),
       recurrenceButtonText: this.getRecurrenceButtonText()
     });
@@ -8718,6 +9233,7 @@ module.exports = MainPopoverScreen = (function(superClass) {
   MainPopoverScreen.prototype.afterRender = function() {
     var ref, timepickerEvents;
     this.$el.attr('tabindex', 0);
+    this.description = this.$('.input-desc');
     this.$container = this.$('.popover-content-wrapper');
     this.$addButton = this.$('.btn.add');
     this.removeButton = this.$('.remove');
@@ -8725,6 +9241,7 @@ module.exports = MainPopoverScreen = (function(superClass) {
     this.duplicateButton = this.$('.duplicate');
     this.$optionalFields = this.$('[data-optional="true"]');
     this.$moreDetailsButton = this.$('.advanced-link');
+    this.$detailsButton = this.$('.input-details button');
     if (this.model.isNew()) {
       this.removeButton.hide();
       this.duplicateButton.hide();
@@ -8742,15 +9259,16 @@ module.exports = MainPopoverScreen = (function(superClass) {
     };
     this.$('input[type="time"]').attr('type', 'text').timepicker(defTimePickerOpts).delegate(timepickerEvents);
     this.$('.input-date').datetimepicker(defDatePickerOps);
-    this.calendar = new ComboBox({
+    this.calendarComboBox = new ComboBox({
       el: this.$('.calendarcombo'),
       small: true,
       source: app.calendars.toAutoCompleteSource(),
-      current: (ref = this.model.getCalendar()) != null ? ref.get('name') : void 0
+      current: (ref = this.formModel.getCalendar()) != null ? ref.get('name') : void 0
     });
-    this.calendar.on('edition-complete', (function(_this) {
+    this.calendarComboBox.on('edition-complete', (function(_this) {
       return function(value) {
-        return _this.model.setCalendar(value);
+        _this.formModel.setCalendar(app.calendars.getOrCreateByName(value));
+        return _this.description.focus();
       };
     })(this));
     if (window.popoverExtended) {
@@ -8768,7 +9286,7 @@ module.exports = MainPopoverScreen = (function(superClass) {
 
   MainPopoverScreen.prototype.onKeyUp = function(event) {
     if (event.keyCode === 13 || event.which === 13) {
-      this.calendar.onBlur();
+      this.calendarComboBox.onBlur();
       this.onSetStart();
       this.onSetEnd();
       return this.$addButton.click();
@@ -8777,36 +9295,48 @@ module.exports = MainPopoverScreen = (function(superClass) {
     }
   };
 
+  MainPopoverScreen.prototype.stopKeyUpPropagation = function(event) {
+    return event.stopPropagation();
+  };
+
   MainPopoverScreen.prototype.toggleAllDay = function() {
     var end, start;
-    start = this.model.getStartDateObject();
-    end = this.model.getEndDateObject();
+    start = this.formModel.getStartDateObject();
+    end = this.formModel.getEndDateObject();
     if (this.$('.input-allday').is(':checked')) {
-      this.model.set('start', start.format(allDayDateFieldFormat));
-      this.model.set('end', end.add(1, 'd').format(allDayDateFieldFormat));
+      this.formModel.set('start', start.format(allDayDateFieldFormat));
+      this.formModel.set('end', end.add(1, 'd').format(allDayDateFieldFormat));
     } else {
-      this.model.set('start', start.hour(12).toISOString());
-      this.model.set('end', start.hour(13).toISOString());
+      this.formModel.set('start', start.hour(12).toISOString());
+      this.formModel.set('end', start.hour(13).toISOString());
     }
-    this.$('.input-time').attr('aria-hidden', this.model.isAllDay());
-    return this.$container.toggleClass('is-all-day', this.model.isAllDay());
+    this.$('.input-time').attr('aria-hidden', this.formModel.isAllDay());
+    return this.$container.toggleClass('is-all-day', this.formModel.isAllDay());
   };
 
   MainPopoverScreen.prototype.onSetDesc = function(ev) {
-    return this.model.set('description', ev.target.value);
+    return this.formModel.set('description', ev.target.value);
   };
 
   MainPopoverScreen.prototype.onSetPlace = function(ev) {
-    return this.model.set('place', ev.target.value);
+    return this.formModel.set('place', ev.target.value);
   };
 
   MainPopoverScreen.prototype.onSetStart = function() {
-    return this.model.setStart(this.formatDateTime(this.$('.input-start').val(), this.$('.input-start-date').val(), false));
+    return this.formModel.setStart(this.formatDateTime(this.$('.input-start').val(), this.$('.input-start-date').val(), false));
   };
 
   MainPopoverScreen.prototype.onSetEnd = function() {
-    this.model.setEnd(this.formatDateTime(this.$('.input-end-time').val(), this.$('.input-end-date').val()));
-    return this.$container.toggleClass('is-same-day', this.model.isSameDay());
+    this.formModel.setEnd(this.formatDateTime(this.$('.input-end-time').val(), this.$('.input-end-date').val()));
+    return this.$container.toggleClass('is-same-day', this.formModel.isSameDay());
+  };
+
+  MainPopoverScreen.prototype.onCalendarColorChange = function(calendar) {
+    return this.calendarComboBox.buildBadge(calendar.get('color'));
+  };
+
+  MainPopoverScreen.prototype.onCalendarsChange = function(calendars) {
+    return this.calendarComboBox.resetComboBox(app.calendars.toAutoCompleteSource());
   };
 
   MainPopoverScreen.prototype.formatDateTime = function(timeStr, dateStr, end) {
@@ -8829,7 +9359,7 @@ module.exports = MainPopoverScreen = (function(superClass) {
       ref1 = d.slice(1, 4), date = ref1[0], month = ref1[1], year = ref1[2];
     }
     if (end) {
-      if (date && this.model.isAllDay()) {
+      if (date && this.formModel.isAllDay()) {
         date = +date + 1;
       }
     }
@@ -8867,7 +9397,7 @@ module.exports = MainPopoverScreen = (function(superClass) {
   MainPopoverScreen.prototype.onDuplicateClicked = function() {
     var attrs, calendarEvent, key, ref, value;
     attrs = [];
-    ref = this.model.attributes;
+    ref = this.formModel.attributes;
     for (key in ref) {
       value = ref[key];
       attrs[key] = value;
@@ -8899,14 +9429,14 @@ module.exports = MainPopoverScreen = (function(superClass) {
   };
 
   MainPopoverScreen.prototype.onAddClicked = function() {
-    var err, errors, i, len, results, spinner;
+    var calendar, err, errors, i, len, results, saveEvent, spinner;
     if (this.$('.btn.add').hasClass('disabled')) {
       return;
     }
     spinner = '<img src="img/spinner-white.svg" alt="spinner" />';
     this.$addButton.empty();
     this.$addButton.append(spinner);
-    errors = this.model.validate(this.model.attributes);
+    errors = this.model.validate(this.formModel.attributes);
     if (errors) {
       this.$addButton.html(this.getButtonText());
       this.$('.alert').remove();
@@ -8918,26 +9448,41 @@ module.exports = MainPopoverScreen = (function(superClass) {
       }
       return results;
     } else {
-      return this.model.save({}, {
-        wait: true,
-        success: (function(_this) {
-          return function() {
-            _this.calendar.save();
-            return app.events.add(_this.model, {
-              sort: false
-            });
-          };
-        })(this),
-        error: function() {
-          return alert('server error occured');
-        },
-        complete: (function(_this) {
-          return function() {
-            _this.$addButton.html(_this.getButtonText());
-            return _this.popover.selfclose(false);
-          };
-        })(this)
-      });
+      calendar = this.formModel.getCalendar();
+      this.model.setCalendar(calendar);
+      saveEvent = (function(_this) {
+        return function() {
+          return _this.model.save(_this.formModel.attributes, {
+            wait: true,
+            success: function(model) {
+              return app.events.add(model, {
+                sort: false
+              });
+            },
+            error: function() {
+              return alert('server error occured');
+            },
+            complete: function() {
+              _this.$addButton.html(_this.getButtonText());
+              return _this.popover.selfclose(false);
+            }
+          });
+        };
+      })(this);
+      if (calendar.isNew()) {
+        return calendar.save(calendar.attributes, {
+          wait: true,
+          success: function() {
+            app.calendars.add(calendar);
+            return saveEvent();
+          },
+          error: function() {
+            return alert('server error occured');
+          }
+        });
+      } else {
+        return saveEvent();
+      }
     }
   };
 
@@ -8972,27 +9517,31 @@ module.exports = MainPopoverScreen = (function(superClass) {
 
   MainPopoverScreen.prototype.getGuestsButtonText = function() {
     var guests, numOthers, options;
-    guests = this.model.get('attendees') || [];
+    guests = this.formModel.get('attendees') || [];
     if (guests.length === 0) {
       return t("add guest button");
     } else if (guests.length === 1) {
-      return guests[0].email;
+      return guests[0].label;
     } else {
       numOthers = guests.length - 1;
       options = {
-        first: guests[0].email,
+        first: guests[0].label,
         smart_count: numOthers
       };
       return t("guests list", options);
     }
   };
 
+  MainPopoverScreen.prototype.getDetailsButtonText = function() {
+    return this.formModel.get('details') || t("placeholder description");
+  };
+
   MainPopoverScreen.prototype.getRecurrenceButtonText = function() {
     var e, error1, language, locale, rrule;
-    rrule = this.model.get('rrule');
+    rrule = this.formModel.get('rrule');
     if ((rrule != null ? rrule.length : void 0) > 0) {
       try {
-        rrule = RRule.fromString(this.model.get('rrule'));
+        rrule = RRule.fromString(this.formModel.get('rrule'));
       } catch (error1) {
         e = error1;
         console.error(e);
@@ -9018,23 +9567,19 @@ module.exports = MainPopoverScreen = (function(superClass) {
   MainPopoverScreen.prototype.expandPopover = function() {
     this.$optionalFields.attr('aria-hidden', false);
     this.$moreDetailsButton.hide();
-    return setTimeout((function(_this) {
-      return function() {
-        return _this.$('.input-details-trigger').focus();
-      };
-    })(this), 100);
+    return this.$detailsButton.focus();
   };
 
   MainPopoverScreen.prototype.onStartChange = function() {
     var newValue;
-    newValue = this.model.getStartDateObject().format(tFormat);
+    newValue = this.formModel.getStartDateObject().format(tFormat);
     return this.$('.input-start').timepicker('setTime', newValue);
   };
 
   MainPopoverScreen.prototype.onEndChange = function() {
     var endOffset, newValue;
-    endOffset = this.model.isAllDay() ? -1 : 0;
-    newValue = this.model.getEndDateObject().add(endOffset, 'd').format(tFormat);
+    endOffset = this.formModel.isAllDay() ? -1 : 0;
+    newValue = this.formModel.getEndDateObject().add(endOffset, 'd').format(tFormat);
     return this.$('.input-end-time').timepicker('setTime', newValue);
   };
 
@@ -9044,13 +9589,13 @@ module.exports = MainPopoverScreen = (function(superClass) {
 });
 
 ;require.register("views/popover_screens/repeat.coffee", function(exports, require, module) {
-var NO_REPEAT, PopoverScreenView, RepeatPopoverScreen, allDayDateFieldFormat, dFormat, inputDateDTPickerFormat, tFormat,
+var EventPopoverScreenView, NO_REPEAT, RepeatPopoverScreen, allDayDateFieldFormat, dFormat, inputDateDTPickerFormat, tFormat,
   bind = function(fn, me){ return function(){ return fn.apply(me, arguments); }; },
   extend = function(child, parent) { for (var key in parent) { if (hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; },
   hasProp = {}.hasOwnProperty,
   indexOf = [].indexOf || function(item) { for (var i = 0, l = this.length; i < l; i++) { if (i in this && this[i] === item) return i; } return -1; };
 
-PopoverScreenView = require('lib/popover_screen_view');
+EventPopoverScreenView = require('views/calendar_popover_screen_event');
 
 tFormat = 'HH:mm';
 
@@ -9104,9 +9649,9 @@ module.exports = RepeatPopoverScreen = (function(superClass) {
         monthlyRepeatBy: 'repeat-day'
       }
     });
-    if (this.model.has('rrule') && this.model.get('rrule').length > 0) {
+    if (this.formModel.has('rrule') && this.formModel.get('rrule').length > 0) {
       try {
-        rruleOptions = RRule.fromString(this.model.get('rrule')).options;
+        rruleOptions = RRule.fromString(this.formModel.get('rrule')).options;
       } catch (error) {
         e = error;
         console.error(e);
@@ -9227,12 +9772,12 @@ module.exports = RepeatPopoverScreen = (function(superClass) {
     } else {
       rruleString = null;
     }
-    return this.model.set('rrule', rruleString);
+    return this.formModel.set('rrule', rruleString);
   };
 
   RepeatPopoverScreen.prototype.buildRRuleFromDOM = function() {
     var RRuleWdays, day, monthmode, options, rawDate, start, wk;
-    start = this.model.getStartDateObject();
+    start = this.formModel.getStartDateObject();
     RRuleWdays = [RRule.SU, RRule.MO, RRule.TU, RRule.WE, RRule.TH, RRule.FR, RRule.SA];
     options = {
       freq: +this.$('select[name="frequency"]').val(),
@@ -9318,7 +9863,7 @@ module.exports = RepeatPopoverScreen = (function(superClass) {
 
   return RepeatPopoverScreen;
 
-})(PopoverScreenView);
+})(EventPopoverScreenView);
 });
 
 ;require.register("views/settings_modal.coffee", function(exports, require, module) {
@@ -9500,13 +10045,18 @@ var __templateData = function template(locals) {
 var buf = [];
 var jade_mixins = {};
 var jade_interp;
-;var locals_for_with = (locals || {});(function (active, calendarMode, title, todaytxt) {
+;var locals_for_with = (locals || {});(function (active, calendarMode, isMobile, title, todaytxt) {
 buf.push("<div class=\"fc-header-left\">");
 if ( calendarMode)
 {
-buf.push("<div role=\"group\" class=\"btn-group\"><span class=\"btn fc-button-prev fc-corner-left\"><i class=\"fa fa-angle-left\"></i></span><span class=\"btn title\">" + (jade.escape(null == (jade_interp = title) ? "" : jade_interp)) + "</span><span class=\"btn fc-button-next fc-corner-right\"><i class=\"fa fa-angle-right\"></i></span></div><div" + (jade.cls(['btn','fc-button-today',active('today')], [null,null,true])) + ">" + (jade.escape(null == (jade_interp = todaytxt) ? "" : jade_interp)) + "</div>");
+buf.push("<div role=\"group\" class=\"btn-group\"><span class=\"btn fc-button-prev fc-corner-left\"><i class=\"fa fa-angle-left\"></i></span><span class=\"btn title\">" + (jade.escape(null == (jade_interp = title) ? "" : jade_interp)) + "</span><span class=\"btn fc-button-next fc-corner-right\"><i class=\"fa fa-angle-right\"></i></span></div><div" + (jade.cls(['btn','fc-button',active('today')], [null,null,true])) + ">" + (jade.escape(null == (jade_interp = todaytxt) ? "" : jade_interp)) + "</div><div id=\"shared-events-button\" class=\"fc-button-wrapper\"></div>");
 }
-buf.push("<span class=\"fc-header-title\"></span></div><!-- just preload the image for fast display when used--><img src=\"img/spinner-white.svg\" class=\"hidden\"/><div class=\"fc-header-right\"><div role=\"group\" class=\"btn-group\"><span type=\"button\"" + (jade.cls(['btn','fc-button-month',active('month')], [null,null,true])) + ">" + (jade.escape(null == (jade_interp = t('month')) ? "" : jade_interp)) + "</span><span type=\"button\"" + (jade.cls(['btn','fc-button-week',active('week')], [null,null,true])) + ">" + (jade.escape(null == (jade_interp = t('week')) ? "" : jade_interp)) + "</span><span type=\"button\"" + (jade.cls(['btn','fc-button-list',active('list')], [null,null,true])) + ">" + (jade.escape(null == (jade_interp = t('list')) ? "" : jade_interp)) + "</span></div><div role=\"group\" class=\"btn-group\"><a href=\"#settings\" class=\"btn btn-settings\"><i class=\"fa fa-refresh\"></i><span>" + (jade.escape(null == (jade_interp = t('sync settings button label')) ? "" : jade_interp)) + "</span></a></div></div>");}.call(this,"active" in locals_for_with?locals_for_with.active:typeof active!=="undefined"?active:undefined,"calendarMode" in locals_for_with?locals_for_with.calendarMode:typeof calendarMode!=="undefined"?calendarMode:undefined,"title" in locals_for_with?locals_for_with.title:typeof title!=="undefined"?title:undefined,"todaytxt" in locals_for_with?locals_for_with.todaytxt:typeof todaytxt!=="undefined"?todaytxt:undefined));;return buf.join("");
+buf.push("<span class=\"fc-header-title\"></span></div><!-- just preload the image for fast display when used--><img src=\"img/spinner-white.svg\" class=\"hidden\"/><div class=\"fc-header-right\">");
+if ( !isMobile)
+{
+buf.push("<div role=\"group\" class=\"btn-group\"><span type=\"button\"" + (jade.cls(['btn','fc-button-month',active('month')], [null,null,true])) + ">" + (jade.escape(null == (jade_interp = t('month')) ? "" : jade_interp)) + "</span><span type=\"button\"" + (jade.cls(['btn','fc-button-list',active('list')], [null,null,true])) + ">" + (jade.escape(null == (jade_interp = t('list')) ? "" : jade_interp)) + "</span></div>");
+}
+buf.push("<div role=\"group\" class=\"btn-group\"><a href=\"#settings\" class=\"btn btn-settings\"><i class=\"fa fa-refresh\"></i><span>" + (jade.escape(null == (jade_interp = t('sync settings button label')) ? "" : jade_interp)) + "</span></a></div></div>");}.call(this,"active" in locals_for_with?locals_for_with.active:typeof active!=="undefined"?active:undefined,"calendarMode" in locals_for_with?locals_for_with.calendarMode:typeof calendarMode!=="undefined"?calendarMode:undefined,"isMobile" in locals_for_with?locals_for_with.isMobile:typeof isMobile!=="undefined"?isMobile:undefined,"title" in locals_for_with?locals_for_with.title:typeof title!=="undefined"?title:undefined,"todaytxt" in locals_for_with?locals_for_with.todaytxt:typeof todaytxt!=="undefined"?todaytxt:undefined));;return buf.join("");
 };
 if (typeof define === 'function' && define.amd) {
   define([], function() {
@@ -9526,6 +10076,25 @@ var jade_mixins = {};
 var jade_interp;
 
 buf.push("<div id=\"alarms\" class=\"well\"></div>");;return buf.join("");
+};
+if (typeof define === 'function' && define.amd) {
+  define([], function() {
+    return __templateData;
+  });
+} else if (typeof module === 'object' && module && module.exports) {
+  module.exports = __templateData;
+} else {
+  __templateData;
+}
+});
+
+;require.register("views/templates/collection_counter.jade", function(exports, require, module) {
+var __templateData = function template(locals) {
+var buf = [];
+var jade_mixins = {};
+var jade_interp;
+;var locals_for_with = (locals || {});(function (collection) {
+buf.push(jade.escape(null == (jade_interp = collection.length) ? "" : jade_interp));}.call(this,"collection" in locals_for_with?locals_for_with.collection:typeof collection!=="undefined"?collection:undefined));;return buf.join("");
 };
 if (typeof define === 'function' && define.amd) {
   define([], function() {
@@ -9702,6 +10271,47 @@ buf.push("<li" + (jade.attr("style", "background-color: #" + (color) + ";", true
 }).call(this);
 
 buf.push("</ul></li><li><a class=\"calendar-rename\">" + (jade.escape(null == (jade_interp = t('rename')) ? "" : jade_interp)) + "</a></li><li><a class=\"calendar-remove\">" + (jade.escape(null == (jade_interp = t('delete')) ? "" : jade_interp)) + "</a></li><li><a class=\"calendar-export\">" + (jade.escape(null == (jade_interp = t('export')) ? "" : jade_interp)) + "</a></li></ul></div><img src=\"img/spinner.svg\" class=\"spinner\"/>");}.call(this,"back" in locals_for_with?locals_for_with.back:typeof back!=="undefined"?back:undefined,"border" in locals_for_with?locals_for_with.border:typeof border!=="undefined"?border:undefined,"color" in locals_for_with?locals_for_with.color:typeof color!=="undefined"?color:undefined,"colorSet" in locals_for_with?locals_for_with.colorSet:typeof colorSet!=="undefined"?colorSet:undefined,"label" in locals_for_with?locals_for_with.label:typeof label!=="undefined"?label:undefined,"undefined" in locals_for_with?locals_for_with.undefined:typeof undefined!=="undefined"?undefined:undefined,"visible" in locals_for_with?locals_for_with.visible:typeof visible!=="undefined"?visible:undefined));;return buf.join("");
+};
+if (typeof define === 'function' && define.amd) {
+  define([], function() {
+    return __templateData;
+  });
+} else if (typeof module === 'object' && module && module.exports) {
+  module.exports = __templateData;
+} else {
+  __templateData;
+}
+});
+
+;require.register("views/templates/pending_event_sharings_button.jade", function(exports, require, module) {
+var __templateData = function template(locals) {
+var buf = [];
+var jade_mixins = {};
+var jade_interp;
+;var locals_for_with = (locals || {});(function (collection) {
+if ( collection.length)
+{
+buf.push("<button class=\"btn fc-button\"><span class=\"collection-counter\"></span><span>" + (jade.escape(null == (jade_interp = ' shared events') ? "" : jade_interp)) + "</span></button><div id=\"shared-events-popup\" style=\"display:none\" class=\"popup\"></div>");
+}}.call(this,"collection" in locals_for_with?locals_for_with.collection:typeof collection!=="undefined"?collection:undefined));;return buf.join("");
+};
+if (typeof define === 'function' && define.amd) {
+  define([], function() {
+    return __templateData;
+  });
+} else if (typeof module === 'object' && module && module.exports) {
+  module.exports = __templateData;
+} else {
+  __templateData;
+}
+});
+
+;require.register("views/templates/pending_event_sharings_button_item.jade", function(exports, require, module) {
+var __templateData = function template(locals) {
+var buf = [];
+var jade_mixins = {};
+var jade_interp;
+;var locals_for_with = (locals || {});(function (model) {
+buf.push("<div class=\"sharer\">" + (jade.escape(null == (jade_interp = model.sharerUrl) ? "" : jade_interp)) + "</div><div class=\"desc\">" + (jade.escape(null == (jade_interp = model.desc) ? "" : jade_interp)) + "</div><div class=\"actions\"><a class=\"accept\">" + (jade.escape(null == (jade_interp = 'Accept') ? "" : jade_interp)) + "</a><a class=\"decline\">" + (jade.escape(null == (jade_interp = 'Decline') ? "" : jade_interp)) + "</a></div>");}.call(this,"model" in locals_for_with?locals_for_with.model:typeof model!=="undefined"?model:undefined));;return buf.join("");
 };
 if (typeof define === 'function' && define.amd) {
   define([], function() {
@@ -9913,7 +10523,7 @@ var __templateData = function template(locals) {
 var buf = [];
 var jade_mixins = {};
 var jade_interp;
-;var locals_for_with = (locals || {});(function (email, index, status) {
+;var locals_for_with = (locals || {});(function (cozy, index, label, shareWithCozy, status) {
 buf.push("<li" + (jade.attr("data-index", index, true, false)) + "><div class=\"guest-top\">");
 if ( status == 'ACCEPTED')
 {
@@ -9931,7 +10541,19 @@ else
 {
 buf.push("<i" + (jade.attr("title", t('mail not sent'), true, false)) + " class=\"fa fa-exclamation-circle orange\"></i>");
 }
-buf.push("<div class=\"guest-label\">" + (jade.escape(null == (jade_interp = email) ? "" : jade_interp)) + "</div><button" + (jade.attr("title", t('screen guest remove tooltip'), true, false)) + " role=\"button\" class=\"guest-delete fa fa-trash-o\"></button></div></li>");}.call(this,"email" in locals_for_with?locals_for_with.email:typeof email!=="undefined"?email:undefined,"index" in locals_for_with?locals_for_with.index:typeof index!=="undefined"?index:undefined,"status" in locals_for_with?locals_for_with.status:typeof status!=="undefined"?status:undefined));;return buf.join("");
+buf.push("<div class=\"guest-label\">" + (jade.escape(null == (jade_interp = label) ? "" : jade_interp)) + "</div><button" + (jade.attr("title", t('screen guest remove tooltip'), true, false)) + " role=\"button\" class=\"guest-delete fa fa-trash-o\"></button><!-- as defined in server/models/contact.coffee if no cozy instance is--><!-- linked to a contact then `cozy` equals '?'-->");
+if (!( cozy == '?'))
+{
+if ( shareWithCozy)
+{
+buf.push("<button" + (jade.attr("title", t('screen guest share with email tooltip'), true, false)) + " role=\"button\" class=\"guest-share-with-email fa fa-envelope-o\"></button>");
+}
+else
+{
+buf.push("<button" + (jade.attr("title", t('screen guest share with cozy tooltip'), true, false)) + " role=\"button\" class=\"guest-share-with-cozy fa fa-cloud\"></button>");
+}
+}
+buf.push("</div></li>");}.call(this,"cozy" in locals_for_with?locals_for_with.cozy:typeof cozy!=="undefined"?cozy:undefined,"index" in locals_for_with?locals_for_with.index:typeof index!=="undefined"?index:undefined,"label" in locals_for_with?locals_for_with.label:typeof label!=="undefined"?label:undefined,"shareWithCozy" in locals_for_with?locals_for_with.shareWithCozy:typeof shareWithCozy!=="undefined"?shareWithCozy:undefined,"status" in locals_for_with?locals_for_with.status:typeof status!=="undefined"?status:undefined));;return buf.join("");
 };
 if (typeof define === 'function' && define.amd) {
   define([], function() {
@@ -9968,13 +10590,13 @@ var __templateData = function template(locals) {
 var buf = [];
 var jade_mixins = {};
 var jade_interp;
-;var locals_for_with = (locals || {});(function (advancedUrl, alerts, allDay, buttonText, dFormat, details, end, guestsButtonText, place, popoverClassName, recurrenceButtonText, rrule, sameDay, start, tFormat) {
+;var locals_for_with = (locals || {});(function (advancedUrl, alerts, allDay, buttonText, dFormat, details, detailsButtonText, end, guestsButtonText, place, popoverClassName, recurrenceButtonText, rrule, sameDay, start, tFormat) {
 popoverClassName  = (allDay ? ' is-all-day' : '')
 popoverClassName += (sameDay? ' is-same-day' : '')
 var showDetailsByDefault = details && details.length > 0
 var showAlertsByDefault = alerts && alerts.length > 0
 var showRepeatByDefault = rrule != null && rrule != void(0) && rrule.length > 0
-buf.push("<div" + (jade.cls(['popover-content-wrapper','label-row',popoverClassName], [null,null,true])) + "><div class=\"item-row\"><label class=\"timed time-row\"><div class=\"icon\"><span class=\"fa fa-arrow-right\"></span></div><span class=\"caption\">" + (jade.escape(null == (jade_interp = t("from")) ? "" : jade_interp)) + "</span><input tabindex=\"2\" type=\"text\" size=\"10\"" + (jade.attr("placeholder", t("placeholder from date"), true, false)) + (jade.attr("value", start.format(dFormat), true, false)) + " class=\"input-start-date input-date\"/><input tabindex=\"3\" type=\"time\" size=\"5\"" + (jade.attr("placeholder", t("placeholder from time"), true, false)) + (jade.attr("value", start.format(tFormat), true, false)) + (jade.attr("aria-hidden", "" + (allDay) + "", true, false)) + " class=\"input-start input-time\"/></label><label class=\"timed time-row\"><div class=\"icon\"><span class=\"fa fa-arrow-left\"></span></div><span class=\"input-end-caption caption\">" + (jade.escape(null == (jade_interp = t("to")) ? "" : jade_interp)) + "</span><input tabindex=\"4\" type=\"text\" size=\"10\"" + (jade.attr("placeholder", t("placeholder to date"), true, false)) + (jade.attr("value", end.format(dFormat), true, false)) + " class=\"input-end-date input-date\"/><input tabindex=\"5\" type=\"time\" size=\"5\"" + (jade.attr("placeholder", t("placeholder to time"), true, false)) + (jade.attr("value", end.format(tFormat), true, false)) + (jade.attr("aria-hidden", "" + (allDay) + "", true, false)) + " class=\"input-end-time input-time\"/></label></div><div class=\"item-row\"><label class=\"all-day\"><input tabindex=\"6\" type=\"checkbox\" value=\"checked\"" + (jade.attr("checked", allDay, true, false)) + " class=\"input-allday\"/><span>" + (jade.escape(null == (jade_interp = t('all day')) ? "" : jade_interp)) + "</span></label></div></div><div class=\"label label-row\"><div" + (jade.attr("title", t("placeholder place"), true, false)) + " class=\"icon\"><span class=\"fa fa-map-marker\"></span></div><input tabindex=\"7\" type=\"text\"" + (jade.attr("value", place, true, false)) + (jade.attr("placeholder", t("placeholder place"), true, false)) + " class=\"input-place input-full-block\"/></div><div class=\"label label-row input-people\"><div" + (jade.attr("title", t("add guest button"), true, false)) + " class=\"icon\"><span class=\"fa fa-users\"></span></div><div class=\"icon right\"><span class=\"fa fa-angle-right\"></span></div><button tabindex=\"8\" class=\"button-full-block\">" + (jade.escape(null == (jade_interp = guestsButtonText) ? "" : jade_interp)) + "</button></div><div data-optional=\"true\"" + (jade.attr("aria-hidden", "" + (!showDetailsByDefault) + "", true, false)) + " class=\"label label-row input-details-row\"><div" + (jade.attr("title", t("placeholder description"), true, false)) + " class=\"icon\"><span class=\"fa fa-align-left\"></span></div><div class=\"icon right\"><span class=\"fa fa-angle-right\"></span></div><input tabindex=\"9\" type=\"text\"" + (jade.attr("value", details, true, false)) + (jade.attr("placeholder", t("placeholder description"), true, false)) + " class=\"input-details-trigger input-full-block\"/></div><div data-optional=\"true\"" + (jade.attr("aria-hidden", "" + (!showAlertsByDefault) + "", true, false)) + " class=\"label label-row input-alert\"><div" + (jade.attr("title", t("alert tooltip"), true, false)) + " class=\"icon\"><span class=\"fa fa-bell\"></span></div><div class=\"icon right\"><span class=\"fa fa-angle-right\"></span></div>");
+buf.push("<div" + (jade.cls(['popover-content-wrapper','label-row',popoverClassName], [null,null,true])) + "><div class=\"item-row\"><label class=\"timed time-row\"><div class=\"icon\"><span class=\"fa fa-arrow-right\"></span></div><span class=\"caption\">" + (jade.escape(null == (jade_interp = t("from")) ? "" : jade_interp)) + "</span><input tabindex=\"2\" type=\"text\" size=\"10\"" + (jade.attr("placeholder", t("placeholder from date"), true, false)) + (jade.attr("value", start.format(dFormat), true, false)) + " class=\"input-start-date input-date\"/><input tabindex=\"3\" type=\"time\" size=\"5\"" + (jade.attr("placeholder", t("placeholder from time"), true, false)) + (jade.attr("value", start.format(tFormat), true, false)) + (jade.attr("aria-hidden", "" + (allDay) + "", true, false)) + " class=\"input-start input-time\"/></label><label class=\"timed time-row\"><div class=\"icon\"><span class=\"fa fa-arrow-left\"></span></div><span class=\"input-end-caption caption\">" + (jade.escape(null == (jade_interp = t("to")) ? "" : jade_interp)) + "</span><input tabindex=\"4\" type=\"text\" size=\"10\"" + (jade.attr("placeholder", t("placeholder to date"), true, false)) + (jade.attr("value", end.format(dFormat), true, false)) + " class=\"input-end-date input-date\"/><input tabindex=\"5\" type=\"time\" size=\"5\"" + (jade.attr("placeholder", t("placeholder to time"), true, false)) + (jade.attr("value", end.format(tFormat), true, false)) + (jade.attr("aria-hidden", "" + (allDay) + "", true, false)) + " class=\"input-end-time input-time\"/></label></div><div class=\"item-row\"><label class=\"all-day\"><input tabindex=\"6\" type=\"checkbox\" value=\"checked\"" + (jade.attr("checked", allDay, true, false)) + " class=\"input-allday\"/><span>" + (jade.escape(null == (jade_interp = t('all day')) ? "" : jade_interp)) + "</span></label></div></div><div class=\"label label-row\"><div" + (jade.attr("title", t("placeholder place"), true, false)) + " class=\"icon\"><span class=\"fa fa-map-marker\"></span></div><input tabindex=\"7\" type=\"text\"" + (jade.attr("value", place, true, false)) + (jade.attr("placeholder", t("placeholder place"), true, false)) + " class=\"input-place input-full-block\"/></div><div class=\"label label-row input-people\"><div" + (jade.attr("title", t("add guest button"), true, false)) + " class=\"icon\"><span class=\"fa fa-users\"></span></div><div class=\"icon right\"><span class=\"fa fa-angle-right\"></span></div><button tabindex=\"8\" class=\"button-full-block\">" + (jade.escape(null == (jade_interp = guestsButtonText) ? "" : jade_interp)) + "</button></div><div data-optional=\"true\"" + (jade.attr("aria-hidden", "" + (!showDetailsByDefault) + "", true, false)) + " class=\"label label-row input-details\"><div" + (jade.attr("title", t("placeholder description"), true, false)) + " class=\"icon\"><span class=\"fa fa-align-left\"></span></div><div class=\"icon right\"><span class=\"fa fa-angle-right\"></span></div><button tabindex=\"9\" class=\"button-full-block\"><span class=\"overflow-wrapper\">" + (jade.escape(null == (jade_interp = detailsButtonText) ? "" : jade_interp)) + "</span></button></div><div data-optional=\"true\"" + (jade.attr("aria-hidden", "" + (!showAlertsByDefault) + "", true, false)) + " class=\"label label-row input-alert\"><div" + (jade.attr("title", t("alert tooltip"), true, false)) + " class=\"icon\"><span class=\"fa fa-bell\"></span></div><div class=\"icon right\"><span class=\"fa fa-angle-right\"></span></div>");
 if ( !alerts || alerts.length === 0)
 {
 buf.push("<button tabindex=\"10\" class=\"button-full-block\">" + (jade.escape(null == (jade_interp = t('no alert button')) ? "" : jade_interp)) + "</button>");
@@ -9983,7 +10605,7 @@ else
 {
 buf.push("<button tabindex=\"10\" class=\"button-full-block\">" + (jade.escape(null == (jade_interp = t('alert label', {smart_count: alerts.length})) ? "" : jade_interp)) + "</button>");
 }
-buf.push("</div><div data-optional=\"true\"" + (jade.attr("aria-hidden", "" + (!showRepeatByDefault) + "", true, false)) + " class=\"label label-row input-repeat\"><div" + (jade.attr("title", t("repeat tooltip"), true, false)) + " class=\"icon\"><span class=\"fa fa-repeat\"></span></div><div class=\"icon right\"><span class=\"fa fa-angle-right\"></span></div><button tabindex=\"11\" class=\"button-full-block\">" + (jade.escape(null == (jade_interp = recurrenceButtonText) ? "" : jade_interp)) + "</button></div><div class=\"popover-footer\"><a role=\"button\" tabindex=\"11\"" + (jade.attr("href", '#' + advancedUrl, true, false)) + " data-tabindex-next=\"13\" class=\"advanced-link\"><div class=\"icon\"><span class=\"fa fa-caret-down\"></span></div>" + (jade.escape(null == (jade_interp = t('more details button')) ? "" : jade_interp)) + "</a><div class=\"buttons\"><a role=\"button\" tabindex=\"13\" class=\"btn btn-link cancel\">" + (jade.escape(null == (jade_interp = t('cancel')) ? "" : jade_interp)) + "</a><a role=\"button\" tabindex=\"14\" class=\"btn add\">" + (jade.escape(null == (jade_interp = buttonText) ? "" : jade_interp)) + "</a></div></div>");}.call(this,"advancedUrl" in locals_for_with?locals_for_with.advancedUrl:typeof advancedUrl!=="undefined"?advancedUrl:undefined,"alerts" in locals_for_with?locals_for_with.alerts:typeof alerts!=="undefined"?alerts:undefined,"allDay" in locals_for_with?locals_for_with.allDay:typeof allDay!=="undefined"?allDay:undefined,"buttonText" in locals_for_with?locals_for_with.buttonText:typeof buttonText!=="undefined"?buttonText:undefined,"dFormat" in locals_for_with?locals_for_with.dFormat:typeof dFormat!=="undefined"?dFormat:undefined,"details" in locals_for_with?locals_for_with.details:typeof details!=="undefined"?details:undefined,"end" in locals_for_with?locals_for_with.end:typeof end!=="undefined"?end:undefined,"guestsButtonText" in locals_for_with?locals_for_with.guestsButtonText:typeof guestsButtonText!=="undefined"?guestsButtonText:undefined,"place" in locals_for_with?locals_for_with.place:typeof place!=="undefined"?place:undefined,"popoverClassName" in locals_for_with?locals_for_with.popoverClassName:typeof popoverClassName!=="undefined"?popoverClassName:undefined,"recurrenceButtonText" in locals_for_with?locals_for_with.recurrenceButtonText:typeof recurrenceButtonText!=="undefined"?recurrenceButtonText:undefined,"rrule" in locals_for_with?locals_for_with.rrule:typeof rrule!=="undefined"?rrule:undefined,"sameDay" in locals_for_with?locals_for_with.sameDay:typeof sameDay!=="undefined"?sameDay:undefined,"start" in locals_for_with?locals_for_with.start:typeof start!=="undefined"?start:undefined,"tFormat" in locals_for_with?locals_for_with.tFormat:typeof tFormat!=="undefined"?tFormat:undefined));;return buf.join("");
+buf.push("</div><div data-optional=\"true\"" + (jade.attr("aria-hidden", "" + (!showRepeatByDefault) + "", true, false)) + " class=\"label label-row input-repeat\"><div" + (jade.attr("title", t("repeat tooltip"), true, false)) + " class=\"icon\"><span class=\"fa fa-repeat\"></span></div><div class=\"icon right\"><span class=\"fa fa-angle-right\"></span></div><button tabindex=\"11\" class=\"button-full-block\">" + (jade.escape(null == (jade_interp = recurrenceButtonText) ? "" : jade_interp)) + "</button></div><div class=\"popover-footer\"><a role=\"button\" tabindex=\"11\"" + (jade.attr("href", '#' + advancedUrl, true, false)) + " data-tabindex-next=\"13\" class=\"advanced-link\"><div class=\"icon\"><span class=\"fa fa-caret-down\"></span></div>" + (jade.escape(null == (jade_interp = t('more details button')) ? "" : jade_interp)) + "</a><div class=\"buttons\"><a role=\"button\" tabindex=\"13\" class=\"btn btn-link cancel\">" + (jade.escape(null == (jade_interp = t('cancel')) ? "" : jade_interp)) + "</a><a role=\"button\" tabindex=\"14\" class=\"btn add\">" + (jade.escape(null == (jade_interp = buttonText) ? "" : jade_interp)) + "</a></div></div>");}.call(this,"advancedUrl" in locals_for_with?locals_for_with.advancedUrl:typeof advancedUrl!=="undefined"?advancedUrl:undefined,"alerts" in locals_for_with?locals_for_with.alerts:typeof alerts!=="undefined"?alerts:undefined,"allDay" in locals_for_with?locals_for_with.allDay:typeof allDay!=="undefined"?allDay:undefined,"buttonText" in locals_for_with?locals_for_with.buttonText:typeof buttonText!=="undefined"?buttonText:undefined,"dFormat" in locals_for_with?locals_for_with.dFormat:typeof dFormat!=="undefined"?dFormat:undefined,"details" in locals_for_with?locals_for_with.details:typeof details!=="undefined"?details:undefined,"detailsButtonText" in locals_for_with?locals_for_with.detailsButtonText:typeof detailsButtonText!=="undefined"?detailsButtonText:undefined,"end" in locals_for_with?locals_for_with.end:typeof end!=="undefined"?end:undefined,"guestsButtonText" in locals_for_with?locals_for_with.guestsButtonText:typeof guestsButtonText!=="undefined"?guestsButtonText:undefined,"place" in locals_for_with?locals_for_with.place:typeof place!=="undefined"?place:undefined,"popoverClassName" in locals_for_with?locals_for_with.popoverClassName:typeof popoverClassName!=="undefined"?popoverClassName:undefined,"recurrenceButtonText" in locals_for_with?locals_for_with.recurrenceButtonText:typeof recurrenceButtonText!=="undefined"?recurrenceButtonText:undefined,"rrule" in locals_for_with?locals_for_with.rrule:typeof rrule!=="undefined"?rrule:undefined,"sameDay" in locals_for_with?locals_for_with.sameDay:typeof sameDay!=="undefined"?sameDay:undefined,"start" in locals_for_with?locals_for_with.start:typeof start!=="undefined"?start:undefined,"tFormat" in locals_for_with?locals_for_with.tFormat:typeof tFormat!=="undefined"?tFormat:undefined));;return buf.join("");
 };
 if (typeof define === 'function' && define.amd) {
   define([], function() {
@@ -10184,6 +10806,8 @@ module.exports = ComboBox = (function(superClass) {
     this.renderItem = bind(this.renderItem, this);
     this.onChange = bind(this.onChange, this);
     this.onEditionComplete = bind(this.onEditionComplete, this);
+    this.onSubmit = bind(this.onSubmit, this);
+    this.onKeyUp = bind(this.onKeyUp, this);
     this.onSelect = bind(this.onSelect, this);
     this.onBlur = bind(this.onBlur, this);
     this.onClose = bind(this.onClose, this);
@@ -10195,7 +10819,7 @@ module.exports = ComboBox = (function(superClass) {
   }
 
   ComboBox.prototype.events = {
-    'keyup': 'onChange',
+    'keyup': 'onKeyUp',
     'keypress': 'onChange',
     'change': 'onChange',
     'blur': 'onBlur'
@@ -10205,15 +10829,7 @@ module.exports = ComboBox = (function(superClass) {
     var caret, isInput, method, value;
     ComboBox.__super__.initialize.call(this);
     this.source = options.source;
-    this.$el.autocomplete({
-      delay: 0,
-      minLength: 0,
-      source: this.source,
-      close: this.onClose,
-      open: this.onOpen,
-      select: this.onSelect
-    });
-    this.$el.addClass('combobox');
+    this.resetComboBox(options.source);
     this.small = options.small;
     this.autocompleteWidget = this.$el.data('ui-autocomplete');
     this.autocompleteWidget._renderItem = this.renderItem;
@@ -10228,6 +10844,18 @@ module.exports = ComboBox = (function(superClass) {
     }
     value = options.current || this.getDefaultValue();
     return this.onEditionComplete(value);
+  };
+
+  ComboBox.prototype.resetComboBox = function(source) {
+    this.$el.autocomplete({
+      delay: 0,
+      minLength: 0,
+      source: source,
+      close: this.onClose,
+      open: this.onOpen,
+      select: this.onSelect
+    });
+    return this.$el.addClass('combobox');
   };
 
   ComboBox.prototype.openMenu = function() {
@@ -10286,9 +10914,22 @@ module.exports = ComboBox = (function(superClass) {
     return this.trigger('edition-complete', (ui != null ? (ref = ui.item) != null ? ref.value : void 0 : void 0) || this.value());
   };
 
+  ComboBox.prototype.onKeyUp = function(ev, ui) {
+    if (ev.keyCode === 13 || ev.which === 13) {
+      return this.onSubmit(ev, ui);
+    } else {
+      return this.onChange(ev, ui);
+    }
+  };
+
+  ComboBox.prototype.onSubmit = function(ev, ui) {
+    ev.stopPropagation();
+    return this.onSelect(ev, ui);
+  };
+
   ComboBox.prototype.onEditionComplete = function(name) {
-    this.tag = app.tags.getOrCreateByName(name);
-    return this.buildBadge(this.tag.get('color'));
+    this.calendar = app.calendars.getOrCreateByName(name);
+    return this.buildBadge(this.calendar.get('color'));
   };
 
   ComboBox.prototype.onChange = function(ev, ui) {
