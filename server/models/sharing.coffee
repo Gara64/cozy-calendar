@@ -2,7 +2,10 @@ cozydb = require 'cozydb'
 urlHelper = require 'cozy-url-sdk'
 Client    = require('request-json').JsonClient
 
-
+client = new Client urlHelper.dataSystem.url()
+if process.env.NODE_ENV is "production" or process.env.NODE_ENV is "test"
+    client.setBasicAuth process.env.NAME, process.env.TOKEN
+    
 module.exports = Sharing = cozydb.getModel 'Sharing',
     sharerUrl: String
     desc: String
@@ -21,7 +24,6 @@ Sharing.pendingBySharedDocType = (docType, callback) ->
 
 
 sendAnswer = (data, callback) ->
-    client = new Client urlHelper.dataSystem.url()
     client.post 'services/sharing/sendAnswer', data, (err, res, body) ->
         if err
             callback err, res
