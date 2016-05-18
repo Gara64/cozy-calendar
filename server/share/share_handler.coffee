@@ -2,7 +2,10 @@ cozydb    = require 'cozydb'
 Client    = require('request-json').JsonClient
 urlHelper = require 'cozy-url-sdk'
 
-
+client = new Client urlHelper.dataSystem.url()
+if process.env.NODE_ENV is "production" or process.env.NODE_ENV is "test"
+    client.setBasicAuth process.env.NAME, process.env.TOKEN
+    
 module.exports.sendShareInvitations = (event, callback) ->
     guests     = event.toJSON().attendees
     needSaving = false
@@ -30,7 +33,7 @@ module.exports.sendShareInvitations = (event, callback) ->
             needSaving   = true
 
     # Send the request to the datasystem
-    client = new Client urlHelper.dataSystem.url()
+    
     client.post "services/sharing/", data, (err, res, body) ->
         if err?
             callback err
